@@ -201,6 +201,10 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
     # DeepseekV4-only: see MLAAttentionSpec.model_version.
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1
+    # Compressor state caches are addressed in original-token positions, so
+    # this ratio must not change the cache manager's logical block size. It is
+    # metadata-only and describes the state window updated by the Compressor.
+    state_compress_ratio: int = 1
     model_version: str | None = None
 
     def __post_init__(self):
@@ -221,11 +225,13 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
         )
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
+        state_compress_ratio_set = set(spec.state_compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
+            and len(state_compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
         ), (
@@ -242,6 +248,7 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
             sliding_window=sliding_window_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
+            state_compress_ratio=state_compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
         )
 

@@ -33,6 +33,7 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import init_ascend_config
 
 # isort: off
@@ -356,6 +357,45 @@ class NPUPlatform(Platform):
             )
 
     @classmethod
+    def _validate_dsa_cp_local_cache_compatibility(cls, vllm_config: VllmConfig) -> None:
+        additional_config = vllm_config.additional_config or {}
+        if not (
+            additional_config.get("enable_dsa_cp", False)
+            and ascend_envs.VLLM_ASCEND_ENABLE_DSA_CP_LOCAL_CACHE
+        ):
+            return
+
+        if get_ascend_device_type() == AscendDeviceType.A2:
+            raise ValueError(
+                "New DSA local-cache CP is not supported on Ascend A2. "
+                "Disable VLLM_ASCEND_ENABLE_DSA_CP_LOCAL_CACHE to use legacy CP."
+            )
+
+        incompatible = []
+        if additional_config.get("enable_shared_expert_dp", False):
+            incompatible.append("shared expert DP (enable_shared_expert_dp)")
+        if getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1) > 1:
+            incompatible.append("PCP (prefill_context_parallel_size > 1)")
+        if additional_config.get("layer_sharding"):
+            incompatible.append("layer sharding")
+
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is not None and not cls._is_mtp_speculative_config(
+            speculative_config
+        ):
+            incompatible.append(
+                f"speculative decoding method {getattr(speculative_config, 'method', None)!r}"
+            )
+
+        if incompatible:
+            raise ValueError(
+                "New DSA local-cache CP is not compatible with: "
+                + ", ".join(incompatible)
+                + ". Disable VLLM_ASCEND_ENABLE_DSA_CP_LOCAL_CACHE or disable "
+                "the incompatible feature(s)."
+            )
+
+    @classmethod
     def _validate_draft_decode_context_parallel_config(
         cls,
         vllm_config: VllmConfig,
@@ -463,6 +503,7 @@ class NPUPlatform(Platform):
         maybe_auto_detect_quantization(vllm_config)
 
         cls._validate_layer_sharding_config(vllm_config)
+        cls._validate_dsa_cp_local_cache_compatibility(vllm_config)
         cls._validate_draft_decode_context_parallel_config(vllm_config)
         cls._validate_parallel_config(vllm_config)
         cls._validate_pd_pp_mtp_config(vllm_config)
@@ -648,6 +689,13 @@ class NPUPlatform(Platform):
             # TODO: this is a tricky way to disable `use_sequence_parallel_moe` in vllm.
             if not vllm_config.compilation_config.pass_config.enable_sp:
                 parallel_config.all2all_backend = "flashinfer_all2allv"
+            logger.info(
+                "MoE SP config: use_sequence_parallel_moe=%s, enable_sp=%s, "
+                "all2all_backend=%s",
+                parallel_config.use_sequence_parallel_moe,
+                vllm_config.compilation_config.pass_config.enable_sp,
+                parallel_config.all2all_backend,
+            )
             if is_310p():
                 parallel_config.worker_cls = "vllm_ascend._310p.worker_310p.NPUWorker310"
             elif ascend_config.xlite_graph_config.enabled:

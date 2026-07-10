@@ -295,6 +295,37 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
         self.assertTrue(len(meta.requests) >= 1)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_build_connector_meta_unscheduled_load_only_req_cannot_save(self, mock_client_cls):
+        config = self._make_config(block_size=16)
+        scheduler = KVPoolScheduler(config, use_layerwise=False)
+        mock_client_cls.return_value.lookup.return_value = 32
+
+        request = MagicMock()
+        request.request_id = "r1"
+        request.prompt_token_ids = list(range(64))
+        request.num_tokens = 64
+        request.block_hashes = [b"h"] * 4
+
+        scheduler.get_num_new_matched_tokens(request, 0)
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = [[0, 1]]
+        scheduler.update_state_after_alloc(request, blocks, 32)
+
+        sched_output = MagicMock()
+        sched_output.finished_req_ids = set()
+        sched_output.preempted_req_ids = set()
+        sched_output.scheduled_new_reqs = []
+        sched_output.num_scheduled_tokens = {}
+        sched_output.scheduled_cached_reqs = MagicMock()
+        sched_output.scheduled_cached_reqs.req_ids = []
+
+        meta = scheduler.build_connector_meta(sched_output)
+
+        self.assertEqual(len(meta.requests), 1)
+        self.assertIsNotNone(meta.requests[0].load_spec)
+        self.assertFalse(meta.requests[0].can_save)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_build_connector_meta_finished_req(self, mock_client_cls):
         config = self._make_config()
         scheduler = KVPoolScheduler(config, use_layerwise=False)

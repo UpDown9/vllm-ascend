@@ -103,9 +103,14 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
-from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
+from vllm_ascend.attention.context_parallel.dsa_cp import (
+    AscendDSACPMetadataBuilder,
+    compact_dsa_cp_sample_tokens,
+    find_dsa_cp_local_cache_plan,
+)
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
@@ -200,6 +205,27 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 
 
+def _set_dsa_cp_batch_layout_on_connector_metadata(
+    connector_metadata: Any,
+    batch_layout: list[tuple[str, int]] | None,
+) -> bool:
+    """Set the new DSA CP layout on direct or nested Store metadata."""
+    updated = False
+    if hasattr(connector_metadata, "dsa_cp_batch_layout"):
+        connector_metadata.dsa_cp_batch_layout = batch_layout
+        updated = True
+
+    child_metadata = getattr(connector_metadata, "metadata", None)
+    if isinstance(child_metadata, (list, tuple)):
+        for child in child_metadata:
+            child_updated = _set_dsa_cp_batch_layout_on_connector_metadata(
+                child,
+                batch_layout,
+            )
+            updated = updated or child_updated
+    return updated
+
+
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -238,6 +264,27 @@ def graph_capture(device: torch.device):
 
 def get_tp_context(drafter):
     return getattr(drafter, "tp_group_context", nullcontext())
+
+
+def _get_dsa_cp_local_cache_plan(attn_metadata):
+    return find_dsa_cp_local_cache_plan(attn_metadata)
+
+
+def _select_dsa_cp_sample_hidden_states(
+    hidden_states: torch.Tensor,
+    global_indices: torch.Tensor,
+    attn_metadata,
+) -> torch.Tensor:
+    if ascend_envs.VLLM_ASCEND_ENABLE_DSA_CP_COMPACT_OUTPUT:
+        local_cache_plan = _get_dsa_cp_local_cache_plan(attn_metadata)
+        if (
+            local_cache_plan is not None
+            and hidden_states.shape[0] == local_cache_plan.local_num_tokens
+        ):
+            return compact_dsa_cp_sample_tokens(
+                hidden_states, global_indices, local_cache_plan
+            )
+    return hidden_states[global_indices]
 
 
 class ExecuteModelState(NamedTuple):
@@ -1988,7 +2035,7 @@ class NPUModelRunner(GPUModelRunner):
                 self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
-       
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -2032,6 +2079,7 @@ class NPUModelRunner(GPUModelRunner):
                 scheduler_output = deepcopy(scheduler_output)
                 scheduler_output.scheduled_cached_reqs.new_token_ids = []
 
+        kv_connector_metadata = None
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             assert kv_connector_metadata is not None
@@ -2262,6 +2310,27 @@ class NPUModelRunner(GPUModelRunner):
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
 
+                local_cache_plan = _get_dsa_cp_local_cache_plan(attn_metadata)
+                if kv_connector_metadata is not None:
+                    dsa_cp_batch_layout: list[tuple[str, int]] | None = None
+                    if local_cache_plan is not None:
+                        # Connector metadata only contains requests that need
+                        # a Store operation. Record the complete model batch
+                        # so omitted requests still contribute their padded
+                        # span to the new DSA CP flattened layout. The plan,
+                        # rather than the global feature switch, is the source
+                        # of truth for the CP mode selected for this forward.
+                        # In particular, a short chunk may fall back to legacy
+                        # CP because it leaves an empty rank.
+                        dsa_cp_batch_layout = [
+                            (req_id, int(num_tokens))
+                            for req_id, num_tokens in zip(req_ids, tokens)
+                        ]
+                    _set_dsa_cp_batch_layout_on_connector_metadata(
+                        kv_connector_metadata,
+                        dsa_cp_batch_layout,
+                    )
+
                 self._sanitize_placeholder_input_ids_for_forward(
                     scheduler_output,
                     num_tokens_padded
@@ -2372,7 +2441,9 @@ class NPUModelRunner(GPUModelRunner):
                     self._finalize_dump_data()
                     return output
 
-                sample_hidden_states = hidden_states[logits_indices]
+                sample_hidden_states = _select_dsa_cp_sample_hidden_states(
+                    hidden_states, logits_indices, attn_metadata
+                )
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
@@ -2383,7 +2454,9 @@ class NPUModelRunner(GPUModelRunner):
                     get_pp_group().send_tensor_dict(hidden_states.tensors, all_gather_group=get_tp_group())
                     logits = None
                 else:
-                    sample_hidden_states = hidden_states[logits_indices]
+                    sample_hidden_states = _select_dsa_cp_sample_hidden_states(
+                        hidden_states, logits_indices, attn_metadata
+                    )
                     logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
@@ -2883,7 +2956,12 @@ class NPUModelRunner(GPUModelRunner):
                 forward_context, num_tokens_padded, positions
             )
 
-        if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
+        if (
+            forward_context.flash_comm_v1_enabled
+            and not getattr(forward_context, "dsa_cp_local_cache_output_gathered", False)
+            and not getattr(forward_context, "dsa_cp_local_cache_output_sharded", False)
+            and not isinstance(hidden_states, IntermediateTensors)
+        ):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
 
@@ -3200,6 +3278,7 @@ class NPUModelRunner(GPUModelRunner):
             positions=self.positions,
             positions_cpu=self._dsa_positions_cpu_buf if self.use_compress else None,
             attn_state=self.attn_state,
+            request_ids=list(self.input_batch.req_ids[:num_reqs_padded]),
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
         )
@@ -3645,6 +3724,12 @@ class NPUModelRunner(GPUModelRunner):
             dummy_compute_logits(hidden_states)
 
             if self.drafter and not profile_cpp:
+                additional_config = self.vllm_config.additional_config or {}
+                use_dsa_cp_local_layout = bool(
+                    self.use_compress
+                    and additional_config.get("enable_dsa_cp", False)
+                    and ascend_envs.VLLM_ASCEND_ENABLE_DSA_CP_LOCAL_CACHE
+                )
                 self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
                     with_prefill=with_prefill,
@@ -3655,6 +3740,7 @@ class NPUModelRunner(GPUModelRunner):
                     dummy_compute_logits=dummy_drafter_compute_logits,
                     in_graph_capturing=not force_attention,
                     is_profile=is_profile,
+                    use_dsa_cp_local_layout=use_dsa_cp_local_layout,
                 )
             if is_profile and self.dynamic_eplb:
                 self.eplb_updator.adaptor.clear_all_moe_loads()

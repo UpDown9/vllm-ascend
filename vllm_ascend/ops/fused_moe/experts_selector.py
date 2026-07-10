@@ -27,6 +27,39 @@ from vllm_ascend.distributed.utils import split_tensor_along_first_dim
 from vllm_ascend.utils import get_weight_prefetch_method
 
 
+def _get_dsa_cp_local_cache_plan(forward_context):
+    attn_metadata = getattr(forward_context, "attn_metadata", None)
+    if not attn_metadata:
+        return None
+    metadata_values = attn_metadata.values() if isinstance(attn_metadata, dict) else attn_metadata
+    for metadata in metadata_values:
+        req_metadata = getattr(metadata, "req_metadata", None)
+        cp_metadata = getattr(req_metadata, "cp_metadata", None)
+        local_cache_plan = getattr(cp_metadata, "local_cache_plan", None)
+        if local_cache_plan is not None:
+            return local_cache_plan
+    return None
+
+
+def _select_dsa_cp_local_input_ids(input_ids: torch.Tensor, local_cache_plan) -> torch.Tensor:
+    num_actual_tokens = sum(local_cache_plan.all_rank_num_tokens)
+    if input_ids.shape[0] < num_actual_tokens:
+        raise RuntimeError(
+            "DSA CP local-cache input IDs are shorter than the current "
+            f"prefill: expected at least {num_actual_tokens}, got {input_ids.shape[0]}."
+        )
+    input_ids = input_ids[:num_actual_tokens]
+    if not local_cache_plan.local_valid_ranges:
+        return input_ids[:0]
+    if len(local_cache_plan.local_valid_ranges) == 1:
+        start, end = local_cache_plan.local_valid_ranges[0]
+        return input_ids[start:end].contiguous()
+    return torch.cat(
+        [input_ids[start:end] for start, end in local_cache_plan.local_valid_ranges],
+        dim=0,
+    ).contiguous()
+
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -253,15 +286,22 @@ def _select_experts_with_fusion_ops(
         if tid2eid is not None:
             forward_context = get_forward_context()
             input_ids = forward_context.input_ids.to(torch.int64)
+            local_cache_plan = _get_dsa_cp_local_cache_plan(forward_context)
             # tid2eid_ones = torch.ones(tid2eid.shape[0],tid2eid.shape[1],device=router_logits.device,dtype=torch.int32)
             tid2eid_ones = tid2eid.to(torch.int32)
-            if forward_context.moe_comm_type == MoECommType.ALLGATHER:
+            if local_cache_plan is not None:
+                input_ids = _select_dsa_cp_local_input_ids(input_ids, local_cache_plan)
+            elif forward_context.moe_comm_type == MoECommType.ALLGATHER:
                 prepare_finalize = forward_context.moe_comm_method.prepare_finalize
                 input_ids = prepare_finalize.all_gather_input_id_with_dp_group(input_ids)
             else:
                 input_ids = forward_context.moe_comm_method.pad_and_split_input_ids(input_ids)
 
-            if forward_context.flash_comm_v1_enabled and forward_context.moe_comm_type != MoECommType.ALLGATHER:
+            if (
+                local_cache_plan is None
+                and forward_context.flash_comm_v1_enabled
+                and forward_context.moe_comm_type != MoECommType.ALLGATHER
+            ):
                 # Process for Flash Comm V1
                 tp_size = get_tp_group().world_size
                 tp_rank = get_tp_group().rank_in_group

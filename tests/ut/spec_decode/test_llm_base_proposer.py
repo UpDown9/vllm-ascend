@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from vllm.config import CUDAGraphMode
@@ -38,6 +39,83 @@ NON_FULL_CUDAGRAPH_MODES = [
     CUDAGraphMode.NONE,
     CUDAGraphMode.PIECEWISE,
 ]
+
+
+class TestDummySampleCount:
+    @staticmethod
+    def _make_proposer(
+        method: str = "mtp",
+        *,
+        is_kv_producer: bool = True,
+        is_kv_consumer: bool = False,
+    ):
+        proposer = AscendSpecDecodeBaseProposer.__new__(AscendSpecDecodeBaseProposer)
+        proposer.method = method
+        proposer.extra_slots_per_request = 2
+        proposer.runner = SimpleNamespace(
+            is_kv_producer=is_kv_producer,
+            is_kv_consumer=is_kv_consumer,
+        )
+        return proposer
+
+    @pytest.mark.parametrize("num_reqs", [1, 4])
+    def test_new_cp_prefill_uses_one_sampling_row_per_request(self, num_reqs):
+        proposer = self._make_proposer()
+        with patch(
+            "vllm_ascend.spec_decode.llm_base_proposer.ascend_envs."
+            "VLLM_ASCEND_ENABLE_DSA_CP_COMPACT_OUTPUT",
+            True,
+        ):
+            sample_count, is_new_cp_prefill = (
+                proposer._get_dummy_sample_count(
+                    batch_size=16384,
+                    num_reqs=num_reqs,
+                    use_dsa_cp_local_layout=True,
+                )
+            )
+
+        assert sample_count == num_reqs
+        assert is_new_cp_prefill
+
+    @pytest.mark.parametrize(
+        "method,compact_output,use_dsa_cp_local_layout,is_kv_producer,is_kv_consumer",
+        [
+            ("mtp", False, True, True, False),
+            ("mtp", True, False, True, False),
+            ("eagle3", True, True, True, False),
+            ("mtp", True, True, False, True),
+            ("mtp", True, True, False, False),
+            ("mtp", True, True, True, True),
+        ],
+    )
+    def test_non_new_cp_paths_keep_existing_sampling_shape(
+        self,
+        method,
+        compact_output,
+        use_dsa_cp_local_layout,
+        is_kv_producer,
+        is_kv_consumer,
+    ):
+        proposer = self._make_proposer(
+            method,
+            is_kv_producer=is_kv_producer,
+            is_kv_consumer=is_kv_consumer,
+        )
+        with patch(
+            "vllm_ascend.spec_decode.llm_base_proposer.ascend_envs."
+            "VLLM_ASCEND_ENABLE_DSA_CP_COMPACT_OUTPUT",
+            compact_output,
+        ):
+            sample_count, is_new_cp_prefill = (
+                proposer._get_dummy_sample_count(
+                    batch_size=16,
+                    num_reqs=4,
+                    use_dsa_cp_local_layout=use_dsa_cp_local_layout,
+                )
+            )
+
+        assert sample_count == 32
+        assert not is_new_cp_prefill
 
 
 class TestDisablePaddedDrafterBatchWithFullGraph:

@@ -18,6 +18,7 @@ import vllm_ascend.spec_decode.llm_base_proposer as llm_base_proposer
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import clear_ascend_config, init_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.context_parallel.dsa_cp import build_dsa_cp_local_cache_plan
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
@@ -794,6 +795,198 @@ class TestEagleProposerMaybePadAndGather:
             assert reduced_hidden_states is model_hidden_states
             assert reduced_positions is model_positions
 
+    def test_mtp_new_cp_keeps_embedding_inputs_global(self):
+        proposer = self._new_proposer("mtp")
+        plan = build_dsa_cp_local_cache_plan(
+            num_input_tokens=258,
+            cp_size=2,
+            cp_rank=1,
+            query_start_loc=[0, 129, 258],
+        )
+        # Include graph padding after the 258 actual tokens. It must not enter
+        # the local MTP input layout.
+        input_ids = torch.arange(260, device=self.device)
+        positions = input_ids + 1000
+        hidden_states = input_ids.unsqueeze(-1).repeat(1, 2)
+        inputs_embeds = input_ids.unsqueeze(-1).repeat(1, 3)
+
+        with patch(
+            "vllm_ascend.spec_decode.llm_base_proposer._get_dsa_cp_local_cache_plan",
+            return_value=plan,
+        ):
+            model_ids, local_positions, local_hidden, model_embeds = proposer.prepare_mtp_model_inputs(
+                input_ids,
+                positions,
+                hidden_states,
+                inputs_embeds,
+            )
+
+        expected_ids = torch.cat([input_ids[start:end] for start, end in plan.local_valid_ranges])
+        # Vocab-parallel embedding must see identical, global token rows on
+        # every TP rank. DeepSeek V4 selects the CP-local rows after embedding.
+        assert model_ids is input_ids
+        assert model_embeds is inputs_embeds
+        assert torch.equal(local_positions, expected_ids + 1000)
+        assert local_hidden is not None
+        assert torch.equal(local_hidden[:, 0], expected_ids)
+
+        with patch(
+            "vllm_ascend.spec_decode.llm_base_proposer._get_dsa_cp_local_cache_plan",
+            return_value=plan,
+        ):
+            _, _, already_local_hidden, _ = proposer.prepare_mtp_model_inputs(
+                input_ids,
+                positions,
+                local_hidden,
+                inputs_embeds,
+            )
+
+        assert already_local_hidden is local_hidden
+
+    def test_mtp_without_new_cp_keeps_legacy_sp_layout(self):
+        proposer = self._new_proposer("mtp")
+        input_ids = torch.arange(6, device=self.device)
+        positions = input_ids + 10
+        hidden_states = input_ids.unsqueeze(-1).repeat(1, 2)
+        inputs_embeds = input_ids.unsqueeze(-1).repeat(1, 3)
+        reduced_hidden = hidden_states[::2]
+        reduced_positions = positions[::2]
+        proposer.maybe_pad_and_reduce = MagicMock(return_value=(reduced_hidden, reduced_positions))
+
+        with patch(
+            "vllm_ascend.spec_decode.llm_base_proposer._get_dsa_cp_local_cache_plan",
+            return_value=None,
+        ):
+            output = proposer.prepare_mtp_model_inputs(
+                input_ids,
+                positions,
+                hidden_states,
+                inputs_embeds,
+            )
+
+        proposer.maybe_pad_and_reduce.assert_called_once_with(hidden_states, positions)
+        assert output[0] is input_ids
+        assert output[1] is reduced_positions
+        assert output[2] is reduced_hidden
+        assert output[3] is inputs_embeds
+
+        proposer._mtp_hidden_states_are_local = True
+        with (
+            patch(
+                "vllm_ascend.spec_decode.llm_base_proposer."
+                "_get_dsa_cp_local_cache_plan",
+                return_value=None,
+            ),
+            pytest.raises(RuntimeError, match="requires a local-cache plan"),
+        ):
+            proposer.prepare_mtp_model_inputs(
+                input_ids, positions, hidden_states, inputs_embeds
+            )
+
+    def test_mtp_new_cp_gathers_hidden_once_and_reuses_global_positions(self):
+        proposer = self._new_proposer("mtp")
+        plan = build_dsa_cp_local_cache_plan(
+            num_input_tokens=258,
+            cp_size=2,
+            cp_rank=1,
+            query_start_loc=[0, 129, 258],
+        )
+        local_hidden = torch.arange(plan.local_num_tokens, device=self.device).view(-1, 1)
+        local_positions = torch.arange(plan.local_num_tokens, device=self.device)
+        global_hidden = torch.arange(258, device=self.device).view(-1, 1)
+        global_positions = torch.arange(258, device=self.device)
+        proposer._get_positions = MagicMock(return_value=global_positions)
+
+        with (
+            patch(
+                "vllm_ascend.spec_decode.llm_base_proposer.ascend_envs."
+                "VLLM_ASCEND_ENABLE_DSA_CP_COMPACT_OUTPUT",
+                False,
+            ),
+            patch(
+                "vllm_ascend.spec_decode.llm_base_proposer._get_dsa_cp_local_cache_plan",
+                return_value=plan,
+            ),
+            patch(
+                "vllm_ascend.spec_decode.llm_base_proposer._gather_dsa_cp_local_tokens",
+                return_value=global_hidden,
+            ) as mock_gather,
+        ):
+            gathered_last, gathered_positions, gathered_hidden = proposer.maybe_all_gather_and_unpad(
+                local_hidden,
+                local_positions,
+                local_hidden,
+            )
+
+        mock_gather.assert_called_once_with(local_hidden, plan)
+        proposer._get_positions.assert_called_once_with(258)
+        assert gathered_last is global_hidden
+        assert gathered_positions is global_positions
+        assert gathered_hidden is global_hidden
+
+    def test_mtp_compact_output_skips_full_hidden_gather(self):
+        proposer = self._new_proposer("mtp")
+        plan = build_dsa_cp_local_cache_plan(
+            num_input_tokens=258,
+            cp_size=2,
+            cp_rank=1,
+            query_start_loc=[0, 129, 258],
+        )
+        local_hidden = torch.arange(plan.local_num_tokens, device=self.device).view(-1, 1)
+        local_positions = torch.arange(plan.local_num_tokens, device=self.device)
+        with (
+            patch(
+                "vllm_ascend.spec_decode.llm_base_proposer.ascend_envs."
+                "VLLM_ASCEND_ENABLE_DSA_CP_COMPACT_OUTPUT",
+                True,
+            ),
+            patch(
+                "vllm_ascend.spec_decode.llm_base_proposer._get_dsa_cp_local_cache_plan",
+                return_value=plan,
+            ),
+            patch(
+                "vllm_ascend.spec_decode.llm_base_proposer._gather_dsa_cp_local_tokens"
+            ) as mock_gather,
+        ):
+            output = proposer.maybe_all_gather_and_unpad(
+                local_hidden,
+                local_positions,
+                local_hidden,
+            )
+
+        mock_gather.assert_not_called()
+        assert output[0] is local_hidden
+        assert output[1] is local_positions
+        assert output[2] is local_hidden
+
+    def test_mtp_compact_output_selects_only_sampling_rows(self):
+        proposer = self._new_proposer("mtp")
+        plan = build_dsa_cp_local_cache_plan(4, 1, 0, [0, 2, 4])
+        local_hidden = torch.arange(8, device=self.device).view(4, 2)
+        sample_indices = torch.tensor([1, 3], device=self.device)
+        expected = local_hidden[sample_indices]
+        with (
+            patch(
+                "vllm_ascend.spec_decode.llm_base_proposer.ascend_envs."
+                "VLLM_ASCEND_ENABLE_DSA_CP_COMPACT_OUTPUT",
+                True,
+            ),
+            patch(
+                "vllm_ascend.spec_decode.llm_base_proposer._get_dsa_cp_local_cache_plan",
+                return_value=plan,
+            ),
+            patch(
+                "vllm_ascend.spec_decode.llm_base_proposer._compact_dsa_cp_sample_tokens",
+                return_value=expected,
+            ) as mock_compact,
+        ):
+            result = proposer._select_mtp_sample_hidden_states(
+                local_hidden, sample_indices
+            )
+
+        mock_compact.assert_called_once_with(local_hidden, sample_indices, plan)
+        assert result is expected
+
     @pytest.mark.parametrize(
         "flash_comm_v1_enabled,expect_split",
         [
@@ -856,11 +1049,22 @@ class TestEagleProposerMaybePadAndGather:
             assert label is True
             return torch.cat((input_tensor, input_tensor + 100), dim=0)
 
-        with patch(
-            "torch.ops.vllm.maybe_all_gather_and_maybe_unpad",
-            side_effect=fake_all_gather_and_unpad,
-            create=True,
-        ) as mock_all_gather:
+        with (
+            patch(
+                "vllm_ascend.spec_decode.llm_base_proposer.ascend_envs."
+                "VLLM_ASCEND_ENABLE_DSA_CP_COMPACT_OUTPUT",
+                True,
+            ),
+            patch(
+                "vllm_ascend.spec_decode.llm_base_proposer._get_dsa_cp_local_cache_plan",
+                return_value=None,
+            ),
+            patch(
+                "torch.ops.vllm.maybe_all_gather_and_maybe_unpad",
+                side_effect=fake_all_gather_and_unpad,
+                create=True,
+            ) as mock_all_gather,
+        ):
             gathered_last_hidden_states, gathered_positions, gathered_hidden_states = (
                 proposer.maybe_all_gather_and_unpad(last_hidden_states, positions, hidden_states)
             )
@@ -3810,6 +4014,61 @@ class TestEagleProposerSetInputsFirstPass:
         ]
         for attr in attrs_from_proposer:
             assert_attr_equal(attr, expected_proposer, proposer)
+
+    def test_set_inputs_first_pass_keeps_new_cp_hidden_local(self):
+        proposer, _ = self._create_proposer(
+            method="eagle",
+            num_speculative_tokens=2,
+            device=self.device,
+            runner=self.runner,
+        )
+        proposer.method = "mtp"
+        plan = build_dsa_cp_local_cache_plan(
+            num_input_tokens=258,
+            cp_size=2,
+            cp_rank=1,
+            query_start_loc=[0, 129, 258],
+        )
+        batch_spec = BatchSpec(seq_lens=[129, 129], query_lens=[129, 129])
+        common_attn_metadata = create_common_attn_metadata(
+            batch_spec,
+            block_size=BLOCK_SIZE,
+            device=self.device,
+        )
+        target_token_ids = torch.arange(258, dtype=torch.int32, device=self.device)
+        target_positions = torch.arange(258, dtype=torch.int64, device=self.device)
+        target_hidden_states = torch.randn(
+            plan.local_num_tokens,
+            proposer.hidden_size,
+            dtype=proposer.dtype,
+            device=self.device,
+        )
+        next_token_ids = torch.tensor([100, 200], dtype=torch.int32, device=self.device)
+
+        with patch(
+            "vllm_ascend.spec_decode.llm_base_proposer.ascend_envs."
+            "VLLM_ASCEND_ENABLE_DSA_CP_COMPACT_OUTPUT",
+            True,
+        ):
+            out_num_tokens, out_indices, _, _ = proposer.set_inputs_first_pass(
+                target_token_ids=target_token_ids,
+                next_token_ids=next_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                token_indices_to_sample=None,
+                cad=common_attn_metadata,
+                num_rejected_tokens_gpu=None,
+            )
+
+        assert out_num_tokens == 258
+        assert torch.equal(
+            out_indices, torch.tensor([128, 257], dtype=torch.int32, device=self.device)
+        )
+        assert proposer._mtp_hidden_states_are_local
+        assert proposer._mtp_local_num_tokens == plan.local_num_tokens
+        assert torch.equal(
+            proposer.hidden_states[: plan.local_num_tokens], target_hidden_states
+        )
 
     def test_set_inputs_first_pass_pcp_dcp_mixed(self):
         """

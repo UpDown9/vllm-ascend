@@ -266,8 +266,8 @@ class KVPoolScheduler:
         else:
             need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
-        logger.debug(
-            "Reqid: %s, Total tokens %d, kvpool hit tokens: %d, need to load: %d",
+        logger.info(
+            "TEST Reqid: %s, Total tokens %d, kvpool hit tokens: %d, need to load: %d",
             request.request_id,
             request.num_tokens,
             num_external_hit_tokens,
@@ -282,8 +282,8 @@ class KVPoolScheduler:
             kvpool_cached_tokens=num_external_hit_tokens,
             can_load=False,
         )
-        logger.info(
-            "KV pool load spec created req=%s vllm_cached=%d kvpool_cached=%d "
+        logger.debug(
+            "TEST KV pool load spec created req=%s vllm_cached=%d kvpool_cached=%d "
             "need_to_allocate=%d load_async=%s use_layerwise=%s",
             request.request_id,
             num_computed_tokens,
@@ -321,7 +321,7 @@ class KVPoolScheduler:
             # No need to load anything
             self.load_specs[request.request_id].can_load = False
             logger.debug(
-                "KV pool load spec disabled req=%s because num_external_tokens=0 vllm_cached=%d kvpool_cached=%d",
+                "TEST KV pool load spec disabled req=%s because num_external_tokens=0 vllm_cached=%d kvpool_cached=%d",
                 request.request_id,
                 self.load_specs[request.request_id].vllm_cached_tokens,
                 self.load_specs[request.request_id].kvpool_cached_tokens,
@@ -342,7 +342,7 @@ class KVPoolScheduler:
 
         self.load_specs[request.request_id].can_load = True
         logger.debug(
-            "KV pool load spec enabled req=%s num_external_tokens=%d vllm_cached=%d kvpool_cached=%d groups=%s",
+            "TEST KV pool load spec enabled req=%s num_external_tokens=%d vllm_cached=%d kvpool_cached=%d groups=%s",
             request.request_id,
             num_external_tokens,
             self.load_specs[request.request_id].vllm_cached_tokens,
@@ -372,13 +372,26 @@ class KVPoolScheduler:
             self._unfinished_requests.pop(req_id, None)
 
         meta = AscendConnectorMetadata(self._unfinished_request_ids, scheduler_output.preempted_req_ids)
+        logger.debug(
+            "TEST KV pool build meta start new=%d cached=%d finished=%d preempted=%d "
+            "force_skip_save=%s role=%s consumer_is_to_put=%s granularity=%d discard_partial_chunks=%s",
+            len(scheduler_output.scheduled_new_reqs),
+            len(scheduler_output.scheduled_cached_reqs.req_ids),
+            len(scheduler_output.finished_req_ids),
+            len(scheduler_output.preempted_req_ids),
+            force_skip_save,
+            self.kv_role,
+            self.consumer_is_to_put,
+            self.cache_transfer_granularity,
+            self._discard_partial_chunks,
+        )
 
         for request in scheduler_output.scheduled_new_reqs:
             # Right now, we only load KV for new requests
             load_spec = self.load_specs.pop(request.req_id, None)
             if load_spec is not None:
                 logger.debug(
-                    "KV pool build meta attaches load spec req=%s can_load=%s "
+                    "TEST KV pool build meta attaches load spec req=%s can_load=%s "
                     "vllm_cached=%d kvpool_cached=%d scheduled_tokens=%d "
                     "num_computed=%d",
                     request.req_id,
@@ -401,6 +414,8 @@ class KVPoolScheduler:
                 mamba_group_ids=self.mamba_group_ids,
                 num_speculative_blocks=self.num_speculative_blocks,
                 block_sizes=self.grouped_block_size,
+                current_chunk_start_token=request.num_computed_tokens,
+                current_chunk_end_token=num_tokens_to_compute,
             )
             self._request_trackers[request.req_id] = request_tracker
             last_chunk_tokens_num = (
@@ -409,6 +424,19 @@ class KVPoolScheduler:
                 else len(request.prompt_token_ids)
             )
 
+            logger.debug(
+                "TEST KV pool build meta new req=%s prompt_len=%d num_computed=%d "
+                "scheduled_tokens=%d token_len=%d block_hashes=%d block_groups=%s "
+                "last_chunk_tokens_num=%d",
+                request.req_id,
+                len(request.prompt_token_ids),
+                request.num_computed_tokens,
+                scheduler_output.num_scheduled_tokens[request.req_id],
+                request_tracker.token_len,
+                len(request_real.block_hashes),
+                [len(blocks) for blocks in request_tracker.allocated_block_ids_by_group],
+                last_chunk_tokens_num,
+            )
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self.cache_transfer_granularity,
@@ -449,12 +477,27 @@ class KVPoolScheduler:
                         mamba_group_ids=self.mamba_group_ids,
                         num_speculative_blocks=self.num_speculative_blocks,
                         block_sizes=self.grouped_block_size,
+                        current_chunk_start_token=request_real.num_computed_tokens,
+                        current_chunk_end_token=num_tokens_to_compute,
                     )
                     self._request_trackers[req_id] = request_tracker
                     last_chunk_tokens_num = (
                         self._floor_to_cache_transfer_granularity(len(request_real.prompt_token_ids))
                         if self._discard_partial_chunks
                         else len(request_real.prompt_token_ids)
+                    )
+                    logger.debug(
+                        "TEST KV pool build meta resumed req=%s prompt_len=%d num_computed=%d "
+                        "scheduled_tokens=%d token_len=%d block_hashes=%d block_groups=%s "
+                        "last_chunk_tokens_num=%d",
+                        req_id,
+                        len(request_real.prompt_token_ids),
+                        request_real.num_computed_tokens,
+                        scheduler_output.num_scheduled_tokens[req_id],
+                        request_tracker.token_len,
+                        len(request_real.block_hashes),
+                        [len(blocks) for blocks in request_tracker.allocated_block_ids_by_group],
+                        last_chunk_tokens_num,
                     )
                     req_meta = ReqMeta.from_request_tracker(
                         request_tracker,
@@ -476,14 +519,26 @@ class KVPoolScheduler:
                     if req_tuple:
                         request = req_tuple[0]
                         num_current_tokens = request_tracker.token_len
-                        new_token_ids = request.all_token_ids[num_current_tokens : num_current_tokens + num_new_tokens]
+                        new_token_ids = request.all_token_ids[
+                            num_current_tokens : num_current_tokens + num_new_tokens
+                        ]
+                        request_tracker.current_chunk_start_token = num_current_tokens
                         request_tracker.token_len += len(new_token_ids)
+                        request_tracker.current_chunk_end_token = request_tracker.token_len
                     else:
                         raise ValueError(
                             f"Request {req_id} is not in _unfinished_requests, but it is scheduled to be cached"
                         )
                     num_computed_token = cached_reqs.num_computed_tokens[i]
                     if num_computed_token >= len(request.prompt_token_ids):
+                        logger.debug(
+                            "TEST KV pool build meta cached skip req=%s reason=decode_after_prompt "
+                            "num_computed_token=%d prompt_len=%d scheduled_tokens=%d",
+                            req_id,
+                            num_computed_token,
+                            len(request.prompt_token_ids),
+                            num_new_tokens,
+                        )
                         continue
                     request_tracker.update(new_block_ids, request.num_computed_tokens)
 
@@ -491,6 +546,20 @@ class KVPoolScheduler:
                         self._floor_to_cache_transfer_granularity(len(request.prompt_token_ids))
                         if self._discard_partial_chunks
                         else len(request.prompt_token_ids)
+                    )
+                    logger.debug(
+                        "TEST KV pool build meta cached req=%s prompt_len=%d num_computed=%d "
+                        "scheduled_tokens=%d token_len=%d block_hashes=%d block_groups=%s "
+                        "last_chunk_tokens_num=%d new_block_groups=%s",
+                        req_id,
+                        len(request.prompt_token_ids),
+                        request.num_computed_tokens,
+                        num_new_tokens,
+                        request_tracker.token_len,
+                        len(request.block_hashes),
+                        [len(blocks) for blocks in request_tracker.allocated_block_ids_by_group],
+                        last_chunk_tokens_num,
+                        [len(blocks) for blocks in normalize_block_ids_by_group(new_block_ids)],
                     )
                     req_meta = ReqMeta.from_request_tracker(
                         request_tracker,
@@ -527,6 +596,8 @@ class KVPoolScheduler:
                     mamba_group_ids=self.mamba_group_ids,
                     num_speculative_blocks=self.num_speculative_blocks,
                     block_sizes=self.grouped_block_size,
+                    current_chunk_start_token=0,
+                    current_chunk_end_token=num_tokens_to_compute,
                 )
 
                 self._request_trackers[request_id] = request_tracker
@@ -534,7 +605,10 @@ class KVPoolScheduler:
                     request_tracker,
                     self.cache_transfer_granularity,
                     load_spec=load_spec,
-                    skip_save=None,
+                    # This request was not scheduled for model execution in
+                    # the current step. It may load existing KV, but must not
+                    # save KV that has not been computed yet.
+                    skip_save=True,
                     block_hashes=request.block_hashes,
                     discard_partial_chunks=self._discard_partial_chunks,
                     original_block_size=self.original_block_size,

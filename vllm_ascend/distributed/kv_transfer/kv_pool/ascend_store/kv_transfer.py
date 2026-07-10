@@ -1,9 +1,15 @@
+from __future__ import annotations
+
+import ctypes
+import math
 import queue
 import threading
 from collections import defaultdict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import numpy as np
 import torch
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
@@ -14,11 +20,211 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend im
 # isort: off
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     ChunkedTokenDatabase,
+    LayerBatchReqMeta,
+    LayerBlockRange,
+    LayerLoadTask,
     LayerMultiBlockReqMeta,
+    LayerTransferTask,
     ReqMeta,
+    SharedBlockData,
     get_block_hashes,
 )
 # isort: on
+
+
+DSA_CP_PREFIX_CACHE_UNIT_SIZE = 128
+
+
+def _circular_shift(lst: list, offset: int) -> list:
+    if not lst or offset == 0:
+        return lst
+    return lst[offset:] + lst[:offset]
+
+
+def _circular_shift_array(value: np.ndarray, offset: int) -> np.ndarray:
+    length = len(value)
+    if length == 0:
+        return value
+    offset %= length
+    if offset == 0:
+        return value
+    return np.concatenate((value[offset:], value[:offset]))
+
+
+class LayerBatchBuilder:
+    def __init__(
+        self,
+        token_database: ChunkedTokenDatabase,
+        my_key_index: int,
+        num_ranks_per_layer: int,
+        page_size_bytes: int,
+        num_layers: int,
+    ) -> None:
+        self.my_key_index = my_key_index
+        self.num_ranks_per_layer = num_ranks_per_layer
+        self.page_size_bytes = page_size_bytes
+        self.num_layers = num_layers
+        self._block_len_np = np.asarray(token_database.group_block_len[0], dtype=np.int64)
+        self._kv_caches_base_addr_np = np.asarray(
+            token_database.group_kv_caches_base_addr[0],
+            dtype=np.int64,
+        )
+        group_block_stride = token_database.group_block_stride.get(0, token_database.group_block_len[0])
+        self._block_stride_np = np.asarray(group_block_stride, dtype=np.int64)
+        # group_block_len[0] / kv_caches_base_addr[0] are laid out flat as
+        # [layer0_caches..., layer1_caches..., ...]; the per-layer stride is the
+        # total length divided by the number of layers (mirrors
+        # ChunkedTokenDatabase caches_per_layer computation).
+        self._caches_per_layer = max(1, self._block_len_np.shape[0] // max(1, num_layers))
+        self._block_ids_buf: np.ndarray | None = None
+        self._block_gvas_buf: np.ndarray | None = None
+
+    def _ensure_buf(self, capacity: int) -> tuple[np.ndarray, np.ndarray]:
+        if self._block_ids_buf is None or len(self._block_ids_buf) < capacity:
+            self._block_ids_buf = np.empty(capacity, dtype=np.int64)
+            self._block_gvas_buf = np.empty(capacity, dtype=np.int64)
+        assert self._block_ids_buf is not None and self._block_gvas_buf is not None
+        return self._block_ids_buf[:capacity], self._block_gvas_buf[:capacity]
+
+    @staticmethod
+    def _dedupe_transfer_blocks(
+        block_ids_arr: np.ndarray,
+        block_gvas_arr: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if block_ids_arr.size <= 1:
+            return block_ids_arr, block_gvas_arr
+
+        block_transfer_array = np.column_stack((block_ids_arr, block_gvas_arr))
+        _, unique_indices = np.unique(
+            block_transfer_array,
+            axis=0,
+            return_index=True,
+        )
+        if unique_indices.size == block_ids_arr.size:
+            return block_ids_arr, block_gvas_arr
+
+        return (
+            block_ids_arr[unique_indices],
+            block_gvas_arr[unique_indices],
+        )
+
+    def _build_transfer_arrays(
+        self,
+        block_ids_arr: np.ndarray,
+        base_gvas_arr: np.ndarray,
+        layer_id: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        caches_per_layer = self._caches_per_layer
+        # group_* arrays are laid out flat as [layer0_caches..., layer1_caches...];
+        # slice the per-layer window for ``layer_id``. Using the full length as the
+        # stride (the old behaviour) overshoots for layer_id >= 1 and yields empty
+        # slices -> broadcast errors.
+        base_offset = layer_id * caches_per_layer
+        layer_base_addrs = self._kv_caches_base_addr_np[base_offset : base_offset + caches_per_layer]
+        layer_block_len = self._block_len_np[base_offset : base_offset + caches_per_layer]
+        layer_block_stride = self._block_stride_np[base_offset : base_offset + caches_per_layer]
+        # Per-cache inner offsets within one layer's page: [0, len0, len0+len1, ...].
+        layer_inner_offsets = np.concatenate(
+            (np.zeros(1, dtype=np.int64), np.cumsum(layer_block_len[:-1], dtype=np.int64))
+        )
+        rank_layer_offset = (layer_id * self.num_ranks_per_layer + self.my_key_index) * self.page_size_bytes
+
+        addr_arr = layer_base_addrs[None, :] + block_ids_arr[:, None] * layer_block_stride[None, :]
+        size_arr = np.broadcast_to(layer_block_len, addr_arr.shape)
+        gvas_arr = base_gvas_arr[:, None] + rank_layer_offset + layer_inner_offsets[None, :]
+
+        return (
+            addr_arr.ravel(),
+            size_arr.ravel(),
+            gvas_arr.ravel(),
+        )
+
+    @staticmethod
+    def _require_request_arrays(
+        block_range: LayerBlockRange,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        request = block_range.request
+        if request.block_ids_np is None or request.block_gvas_np is None:
+            raise RuntimeError("ReqMeta numpy block metadata is not initialized")
+        return request.block_ids_np, request.block_gvas_np
+
+    def build_shared(self, task: LayerTransferTask) -> SharedBlockData | None:
+        """Pre-compute shared block data that is identical across all layers."""
+        if not task.block_ranges:
+            return None
+
+        total = 0
+        for block_range in task.block_ranges:
+            total += block_range.end_block - block_range.start_block
+            if block_range.partial_block_index is not None:
+                total += 1
+
+        block_ids_arr, block_gvas_arr = self._ensure_buf(total)
+        req_ids: list[str] = []
+        is_last_chunks: list[bool | None] = []
+        offset = 0
+
+        for block_range in task.block_ranges:
+            request = block_range.request
+            req_ids.append(request.req_id)
+            is_last_chunks.append(request.is_last_chunk)
+            block_ids_np, block_gvas_np = self._require_request_arrays(block_range)
+
+            num_blocks = block_range.end_block - block_range.start_block
+            if num_blocks > 0:
+                gva_start = block_range.start_block - request.gva_block_offset
+                gva_end = block_range.end_block - request.gva_block_offset
+                if gva_start < 0 or gva_end > len(block_gvas_np):
+                    raise RuntimeError(
+                        "ReqMeta GVA metadata does not cover requested block "
+                        f"range [{block_range.start_block}, {block_range.end_block}) "
+                        f"with offset {request.gva_block_offset}"
+                    )
+                end = offset + num_blocks
+                block_ids_arr[offset:end] = block_ids_np[block_range.start_block : block_range.end_block]
+                block_gvas_arr[offset:end] = block_gvas_np[gva_start:gva_end]
+                offset = end
+
+            if block_range.partial_block_index is not None:
+                assert request.last_block_gva is not None
+                block_ids_arr[offset] = block_ids_np[block_range.partial_block_index]
+                block_gvas_arr[offset] = request.last_block_gva
+                offset += 1
+
+        block_ids_arr, block_gvas_arr = self._dedupe_transfer_blocks(block_ids_arr[:offset], block_gvas_arr[:offset])
+
+        return SharedBlockData(
+            block_ids_arr=block_ids_arr,
+            block_gvas_arr=block_gvas_arr,
+            req_ids=req_ids,
+            is_last_chunks=is_last_chunks,
+        )
+
+    def build_addrs(
+        self,
+        shared: SharedBlockData,
+        layer_id: int,
+    ) -> LayerBatchReqMeta:
+        """Compute per-layer addresses from pre-computed shared block data."""
+        addr_array, size_array, gvas_array = self._build_transfer_arrays(
+            shared.block_ids_arr, shared.block_gvas_arr, layer_id
+        )
+
+        return LayerBatchReqMeta(
+            req_ids=shared.req_ids,
+            layer_id=layer_id,
+            is_last_chunks=shared.is_last_chunks,
+            addr_array=addr_array,
+            size_array=size_array,
+            gvas_array=gvas_array,
+        )
+
+    def build(self, task: LayerTransferTask) -> LayerBatchReqMeta | None:
+        """Full build: shared data + per-layer addresses (backward compat)."""
+        shared = self.build_shared(task)
+        if shared is None:
+            return None
+        return self.build_addrs(shared, task.layer_id)
 
 
 class KVTransferThread(threading.Thread):
@@ -257,6 +463,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
         ready_event: threading.Event,
         group_uses_align_state: list[bool],
         enable_kv_event: bool = False,
+        group_uses_swa: list[bool] | None = None,
+        cp_rank: int = 0,
+        cp_size: int = 1,
+        validate_put_cache_blocks: Callable[
+            [int, list[int], str, list[str]], None
+        ]
+        | None = None,
     ):
         super().__init__(
             m_store, token_database, block_size, tp_rank, dcp_size, ready_event, name="KVCacheSendingThread"
@@ -264,10 +477,16 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.put_step = put_step
         self.kv_role = kv_role
         self.stored_requests = defaultdict[str, int](int)
-        self.group_uses_align_state = group_uses_align_state
+        self.group_uses_align_state = group_uses_align_state or []
+        self.group_uses_swa = group_uses_swa or []
+        self.cp_rank = cp_rank
+        self.cp_size = cp_size
+        self.validate_put_cache_blocks = validate_put_cache_blocks
         self.enable_kv_event = enable_kv_event
         self.completed_events_lock = threading.Lock()
         self.completed_events: dict[int, int] = {}
+        self.put_error_lock = threading.Lock()
+        self.put_error: RuntimeError | None = None
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -296,13 +515,83 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self.completed_events.clear()
         return completed_events
 
+    def raise_put_error(self) -> None:
+        with self.put_error_lock:
+            error = self.put_error
+            self.put_error = None
+        if error is not None:
+            raise error
+
+    @staticmethod
+    def _get_dsa_cp_owner_range(
+        token_len: int, cp_size: int, cp_rank: int, unit_size: int = DSA_CP_PREFIX_CACHE_UNIT_SIZE
+    ) -> tuple[int, int]:
+        num_units = math.ceil(token_len / unit_size)
+        base_units = num_units // cp_size
+        remainder_units = num_units % cp_size
+        local_units = base_units + int(cp_rank < remainder_units)
+        local_start_units = cp_rank * base_units + min(cp_rank, remainder_units)
+        local_start = local_start_units * unit_size
+        return min(local_start, token_len), min(local_start + local_units * unit_size, token_len)
+
+    def _filter_dsa_cp_swa_owner_blocks(
+        self,
+        starts: list[int],
+        ends: list[int],
+        keys: list[str],
+        block_hashes: list,
+        group_id: int,
+        token_len: int,
+        owner_ranges: list[tuple[int, int]] | None = None,
+    ) -> tuple[list[int], list[int], list[str], list]:
+        if group_id >= len(self.group_uses_swa) or not self.group_uses_swa[group_id]:
+            return starts, ends, keys, block_hashes
+
+        if owner_ranges is None:
+            if self.cp_size <= 1:
+                return starts, ends, keys, block_hashes
+            owner_ranges = [self._get_dsa_cp_owner_range(token_len, self.cp_size, self.cp_rank)]
+        owner_ranges = [(start, end) for start, end in owner_ranges if start < end]
+        filtered_starts: list[int] = []
+        filtered_ends: list[int] = []
+        filtered_keys: list[str] = []
+        filtered_hashes: list = []
+        skipped_partial = 0
+        for start, end, key, block_hash in zip(starts, ends, keys, block_hashes):
+            if any(owner_start <= end - 1 < owner_end for owner_start, owner_end in owner_ranges):
+                # A cache-transfer block is owned by the rank containing its
+                # last token. This also handles a transfer-granularity block
+                # whose boundary window crosses CP ranks, while keeping
+                # ownership unique and avoiding duplicate external puts.
+                filtered_starts.append(start)
+                filtered_ends.append(end)
+                filtered_keys.append(key)
+                filtered_hashes.append(block_hash)
+            elif any(start < owner_end and end > owner_start for owner_start, owner_end in owner_ranges):
+                skipped_partial += 1
+        if skipped_partial:
+            logger.warning(
+                "Skip %d partial DSA CP SWA prefix-cache blocks for group %d; "
+                "expected put chunks to be owner-range aligned.",
+                skipped_partial,
+                group_id,
+            )
+        return filtered_starts, filtered_ends, filtered_keys, filtered_hashes
+
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.token_len_chunk
         req_id = req_meta.req_id
         current_event = req_meta.current_event
         try:
+            with self.put_error_lock:
+                if self.put_error is not None:
+                    return
             if req_id not in self.stored_requests:
-                self.request_queue.task_done()
+                logger.debug(
+                    "TEST KV pool put skipped req=%s reason=request_not_tracked token_len=%d",
+                    req_id,
+                    token_len,
+                )
                 return
 
             store_masks = self._store_mask(req_meta)
@@ -335,9 +624,27 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     block_hashes.append(group_block_hashes[start // group_block_size])
                     key_block_ids.append(block_id)
 
+                block_ids_by_start = dict(zip(starts, key_block_ids))
+                starts, ends, keys, block_hashes = self._filter_dsa_cp_swa_owner_blocks(
+                    starts,
+                    ends,
+                    keys,
+                    block_hashes,
+                    group_id,
+                    token_len,
+                    getattr(req_meta, "dsa_cp_swa_owner_ranges", None),
+                )
+                key_block_ids = [block_ids_by_start[start] for start in starts]
+
+                use_explicit_swa_owner = (
+                    group_id < len(self.group_uses_swa)
+                    and self.group_uses_swa[group_id]
+                    and req_meta.dsa_cp_swa_owner_ranges is not None
+                )
                 if (
                     not self.dcp_size > 1
                     and not req_meta.disable_tp_key_sharding
+                    and not use_explicit_swa_owner
                     and not self.group_uses_align_state[group_id]
                 ):
                     starts = starts[self.tp_rank % self.put_step :: self.put_step]
@@ -347,12 +654,32 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     key_block_ids = key_block_ids[self.tp_rank % self.put_step :: self.put_step]
 
                 if not keys:
+                    logger.debug(
+                        "TEST KV pool put skipped req=%s group=%d reason=no_keys token_len=%d "
+                        "block_hashes=%d block_ids=%d put_step=%d tp_rank=%d",
+                        req_id,
+                        group_id,
+                        token_len,
+                        len(req_meta.block_hashes),
+                        len(block_ids),
+                        self.put_step,
+                        self.tp_rank,
+                    )
                     continue
 
                 exists_states = self.lookup(keys)
                 missing_indices = [index for index, exists in enumerate(exists_states) if not exists]
 
                 if not missing_indices:
+                    logger.debug(
+                        "TEST KV pool put skipped req=%s group=%d reason=all_keys_exist token_len=%d "
+                        "keys=%d sample_keys=%s",
+                        req_id,
+                        group_id,
+                        token_len,
+                        len(keys),
+                        keys[:3],
+                    )
                     continue
 
                 starts = [starts[index] for index in missing_indices]
@@ -361,16 +688,16 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 block_hashes = [block_hashes[index] for index in missing_indices]
                 key_block_ids = [key_block_ids[index] for index in missing_indices]
 
-                logger.info(
-                    "Storing KV cache for %d out of %d blocks (missing_count=%d) for request %s in group %d",
-                    len(keys),
-                    token_len // group_block_size,
-                    len(missing_indices),
-                    req_id,
-                    group_id,
-                )
+                # logger.info(
+                #     "Storing KV cache for %d out of %d blocks (missing_count=%d) for request %s in group %d",
+                #     len(keys),
+                #     token_len // group_block_size,
+                #     len(missing_indices),
+                #     req_id,
+                #     group_id,
+                # )
                 logger.debug(
-                    "KV pool put request=%s group=%d token_len=%d keys=%d sample_keys=%s",
+                    "TEST KV pool put request=%s group=%d token_len=%d keys=%d sample_keys=%s",
                     req_id,
                     group_id,
                     token_len,
@@ -426,6 +753,26 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
                 if current_event is not None:
                     current_event.synchronize()
+                if self.validate_put_cache_blocks is not None:
+                    try:
+                        self.validate_put_cache_blocks(
+                            group_id,
+                            key_block_ids,
+                            req_id,
+                            keys,
+                        )
+                    except RuntimeError as error:
+                        with self.put_error_lock:
+                            self.put_error = error
+                        raise
+                # logger.info(
+                #     "[KV-STORE-TRACE] operation=put request_id=%s "
+                #     "group_id=%d tp_rank=%d keys=%s",
+                #     req_id,
+                #     group_id,
+                #     self.tp_rank,
+                #     keys,
+                # )
                 self.m_store.put(keys, addrs, sizes)
 
                 # TODO Query specific replica info to update the event
@@ -434,8 +781,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         finally:
             # always free blocks
             self.mark_completed_events(req_meta.event_id)
-        self.dec_stored_request(req_id)
-        self.request_queue.task_done()
+            self.dec_stored_request(req_id)
+            self.request_queue.task_done()
 
 
 class KVCacheStoreRecvingThread(KVTransferThread):
@@ -505,14 +852,31 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             block_id_list[self.tp_rank % len(block_id_list) :] + block_id_list[: self.tp_rank % len(block_id_list)]
         )
         logger.debug(
-            "KV pool async recv calls backend get request=%s token_len=%d groups=%s keys=%d sample_keys=%s",
+            "TEST KV pool async recv calls backend get request=%s token_len=%d groups=%s keys=%d sample_keys=%s",
             req_id,
             token_len,
             req_meta.kv_cache_group_ids or [0],
             len(key_list_c),
             key_list_c[:3],
         )
+        # logger.info(
+        #     "[KV-STORE-TRACE] operation=load request_id=%s mode=async "
+        #     "groups=%s tp_rank=%d keys=%s",
+        #     req_id,
+        #     group_ids,
+        #     self.tp_rank,
+        #     key_list_c,
+        # )
         ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+        # logger.info(
+        #     "[KV-STORE-TRACE] operation=load_result request_id=%s "
+        #     "mode=async tp_rank=%d key_status=%s",
+        #     req_id,
+        #     self.tp_rank,
+        #     list(zip(key_list_c, ret, strict=False))
+        #     if ret is not None
+        #     else None,
+        # )
         if ret is not None and any(r != 0 for r in ret):
             missing_block_ids = record_failed_blocks(
                 block_id_list_c,
@@ -546,7 +910,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     missing_block_ids,
                 )
         logger.debug(
-            "KV pool async recv backend get returned request=%s token_len=%d groups=%s keys=%d",
+            "TEST KV pool async recv backend get returned request=%s token_len=%d groups=%s keys=%d",
             req_id,
             token_len,
             req_meta.kv_cache_group_ids or [0],
@@ -652,8 +1016,15 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         current_event = req_meta.current_event
         total_block = len(keys)
         is_last_chunk = req_meta.is_last_chunk
+        log_layerwise_put = logger.debug
         with self.done_task_lock:
             if req_meta.req_id not in self.stored_requests:
+                log_layerwise_put(
+                    "TEST KV pool layerwise put skipped req=%s layer=%d reason=request_not_tracked total_blocks=%d",
+                    req_meta.req_id,
+                    layer_id,
+                    total_block,
+                )
                 self.request_queue.task_done()
                 return
         if not self.dcp_size > 1:
@@ -662,6 +1033,16 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             keys = keys[self.tp_rank % self.put_step :: self.put_step]
 
         if not keys:
+            log_layerwise_put(
+                "TEST KV pool layerwise put skipped req=%s layer=%d reason=no_keys_after_shard "
+                "total_blocks=%d put_step=%d tp_rank=%d is_last_chunk=%s",
+                req_meta.req_id,
+                layer_id,
+                total_block,
+                self.put_step,
+                self.tp_rank,
+                is_last_chunk,
+            )
             if layer_id == self.final_layer_id:
                 stored_events = self._build_stored_events(req_meta)
                 if stored_events:
@@ -680,6 +1061,16 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         missing_indices = [index for index, exists in enumerate(exists_states) if not exists]
 
         if not missing_indices:
+            log_layerwise_put(
+                "TEST KV pool layerwise put skipped req=%s layer=%d reason=all_keys_exist "
+                "total_blocks=%d keys=%d is_last_chunk=%s sample_keys=%s",
+                req_meta.req_id,
+                layer_id,
+                total_block,
+                len(key_list),
+                is_last_chunk,
+                key_list[:3],
+            )
             if layer_id == self.final_layer_id:
                 stored_events = self._build_stored_events(req_meta)
                 if stored_events:
@@ -703,6 +1094,17 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             addr_list.append(addr)
             size_list.append(size)
 
+        log_layerwise_put(
+            "TEST KV pool layerwise put request=%s layer=%d total_blocks=%d missing=%d "
+            "keys=%d is_last_chunk=%s sample_keys=%s",
+            req_meta.req_id,
+            layer_id,
+            total_block,
+            len(missing_indices),
+            len(key_list),
+            is_last_chunk,
+            key_list[:3],
+        )
         if current_event is not None:
             current_event.synchronize()
         self.m_store.put(key_list, addr_list, size_list)
@@ -718,24 +1120,24 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             self.set_finished_request(req_meta.req_id)
         self.request_queue.task_done()
 
-        if layer_id == self.final_layer_id:
-            logger.info(
-                "Storing KV cache layerwise for %d out of %d blocks (missing_count=%d) for request %s, layer %d",
-                len(key_list),
-                total_block,
-                len(missing_indices),
-                req_meta.req_id,
-                layer_id,
-            )
-        else:
-            logger.debug(
-                "Storing KV cache layerwise for %d out of %d blocks (missing_count=%d) for request %s, layer %d",
-                len(key_list),
-                total_block,
-                len(missing_indices),
-                req_meta.req_id,
-                layer_id,
-            )
+        # if layer_id == self.final_layer_id:
+        #     logger.info(
+        #         "TEST Storing KV cache layerwise for %d out of %d blocks (missing_count=%d) for request %s, layer %d",
+        #         len(key_list),
+        #         total_block,
+        #         len(missing_indices),
+        #         req_meta.req_id,
+        #         layer_id,
+        #     )
+        # else:
+        #     logger.debug(
+        #         "Storing KV cache layerwise for %d out of %d blocks (missing_count=%d) for request %s, layer %d",
+        #         len(key_list),
+        #         total_block,
+        #         len(missing_indices),
+        #         req_meta.req_id,
+        #         layer_id,
+        #     )
 
 
 class KVCacheStoreLayerRecvingThread(KVTransferThread):

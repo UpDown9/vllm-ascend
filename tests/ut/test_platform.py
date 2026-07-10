@@ -783,6 +783,75 @@ class TestNPUPlatform(TestBase):
 
         self.platform._validate_parallel_config(vllm_config)
 
+    @pytest.mark.parametrize(
+        ("config_updates", "parallel_updates", "spec_method", "error_match"),
+        [
+            ({"enable_shared_expert_dp": True}, {}, None, "shared expert DP"),
+            ({"layer_sharding": ["q_b_proj"]}, {}, None, "layer sharding"),
+            ({}, {"prefill_context_parallel_size": 2}, None, "PCP"),
+            ({}, {}, "eagle3", "speculative decoding method"),
+        ],
+    )
+    @patch("vllm_ascend.platform.get_ascend_device_type", return_value=AscendDeviceType.A3)
+    @patch("vllm_ascend.platform.ascend_envs.VLLM_ASCEND_ENABLE_DSA_CP_LOCAL_CACHE", True)
+    def test_validate_dsa_cp_local_cache_rejects_incompatible_features(
+        self,
+        config_updates,
+        parallel_updates,
+        spec_method,
+        error_match,
+        mock_device_type,
+    ):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.additional_config = {"enable_dsa_cp": True, **config_updates}
+        for name, value in parallel_updates.items():
+            setattr(vllm_config.parallel_config, name, value)
+        if spec_method is not None:
+            vllm_config.speculative_config = MagicMock(method=spec_method)
+
+        with pytest.raises(ValueError, match=error_match):
+            self.platform._validate_dsa_cp_local_cache_compatibility(vllm_config)
+
+    @pytest.mark.parametrize(
+        ("spec_method", "pipeline_parallel_size"),
+        [(None, 1), ("mtp", 1), ("mtp", 2)],
+    )
+    @patch("vllm_ascend.platform.get_ascend_device_type", return_value=AscendDeviceType.A3)
+    @patch("vllm_ascend.platform.ascend_envs.VLLM_ASCEND_ENABLE_DSA_CP_LOCAL_CACHE", True)
+    def test_validate_dsa_cp_local_cache_allows_mtp_and_pp(
+        self, spec_method, pipeline_parallel_size, mock_device_type
+    ):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.additional_config = {"enable_dsa_cp": True}
+        vllm_config.parallel_config.pipeline_parallel_size = pipeline_parallel_size
+        if spec_method is not None:
+            vllm_config.speculative_config = MagicMock(method=spec_method)
+
+        self.platform._validate_dsa_cp_local_cache_compatibility(vllm_config)
+
+    @patch("vllm_ascend.platform.get_ascend_device_type", return_value=AscendDeviceType.A2)
+    @patch("vllm_ascend.platform.ascend_envs.VLLM_ASCEND_ENABLE_DSA_CP_LOCAL_CACHE", True)
+    def test_validate_dsa_cp_local_cache_rejects_a2(
+        self, mock_local_cache_enabled, mock_device_type
+    ):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.additional_config = {"enable_dsa_cp": True}
+
+        with pytest.raises(ValueError, match="not supported on Ascend A2"):
+            self.platform._validate_dsa_cp_local_cache_compatibility(vllm_config)
+
+    @patch("vllm_ascend.platform.get_ascend_device_type")
+    @patch("vllm_ascend.platform.ascend_envs.VLLM_ASCEND_ENABLE_DSA_CP_LOCAL_CACHE", True)
+    def test_validate_dsa_cp_local_cache_keeps_legacy_cp_on_a2(
+        self, mock_local_cache_enabled, mock_device_type
+    ):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.additional_config = {"enable_dsa_cp": False}
+
+        self.platform._validate_dsa_cp_local_cache_compatibility(vllm_config)
+
+        mock_device_type.assert_not_called()
+
     def test_validate_pd_pp_mtp_config_accepts_prefill_producer(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
         vllm_config.speculative_config = MagicMock(method="mtp")

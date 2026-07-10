@@ -42,6 +42,24 @@ from vllm_ascend.distributed.parallel_state import get_embed_tp_group, get_lmhea
 from vllm_ascend.utils import embedding_tp_enable, get_potential_max_tokens, lmhead_tp_enable
 
 
+def _use_dsa_cp_local_cache() -> bool:
+    from vllm_ascend.ascend_forward_context import get_forward_context
+
+    try:
+        forward_context = get_forward_context()
+    except AssertionError:
+        return False
+    attn_metadata = getattr(forward_context, "attn_metadata", None)
+    if not attn_metadata:
+        return False
+    metadata_values = attn_metadata.values() if isinstance(attn_metadata, dict) else attn_metadata
+    return any(
+        getattr(getattr(getattr(metadata, "req_metadata", None), "cp_metadata", None), "local_cache_plan", None)
+        is not None
+        for metadata in metadata_values
+    )
+
+
 class AscendVocabParallelEmbedding(VocabParallelEmbedding):
     """
     Register VocabParallelEmbedding as a custom op for Ascend.
@@ -245,7 +263,10 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         # Reduce across all the model parallel GPUs.
-        output = torch.ops.vllm.maybe_pad_and_reduce(output_parallel)
+        if _use_dsa_cp_local_cache():
+            output = torch.ops.vllm.maybe_pad_and_reduce(output_parallel, False, True)
+        else:
+            output = torch.ops.vllm.maybe_pad_and_reduce(output_parallel)
         return output
 
 
