@@ -6,7 +6,41 @@ import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.model_runner_v1 import (
+    NPUModelRunner,
+    _set_dsa_cp_batch_layout_on_connector_metadata,
+)
+
+
+class TestDSACPConnectorMetadata(unittest.TestCase):
+    def test_sets_layout_on_direct_store_metadata(self):
+        metadata = SimpleNamespace(dsa_cp_batch_layout=None)
+        layout = [("req0", 128)]
+
+        updated = _set_dsa_cp_batch_layout_on_connector_metadata(
+            metadata,
+            layout,
+        )
+
+        self.assertTrue(updated)
+        self.assertEqual(metadata.dsa_cp_batch_layout, layout)
+
+    def test_sets_layout_on_store_metadata_nested_in_multi_connector(self):
+        store_metadata = SimpleNamespace(dsa_cp_batch_layout=None)
+        other_metadata = SimpleNamespace()
+        multi_metadata = SimpleNamespace(
+            metadata=(other_metadata, store_metadata),
+        )
+        layout = [("req0", 128), ("req1", 64)]
+
+        updated = _set_dsa_cp_batch_layout_on_connector_metadata(
+            multi_metadata,
+            layout,
+        )
+
+        self.assertTrue(updated)
+        self.assertEqual(store_metadata.dsa_cp_batch_layout, layout)
+        self.assertFalse(hasattr(other_metadata, "dsa_cp_batch_layout"))
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):

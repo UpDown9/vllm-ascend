@@ -32,6 +32,8 @@ from .deepseek_v4 import (
     DeepseekV2DecoderLayer,
     DeepseekV2MixtureOfExperts,
     DeepseekV4MoE,
+    _get_dsa_cp_local_cache_plan,
+    _prepare_dsa_cp_local_hidden,
     get_spec_layer_idx_from_weight_name,
 )
 
@@ -174,8 +176,17 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        # Vocab-TP reduction requires the same global token rows on every
+        # rank. Convert to the variable-length new-CP layout only after
+        # embedding has completed.
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        local_cache_plan = _get_dsa_cp_local_cache_plan()
+        if (
+            local_cache_plan is not None
+            and inputs_embeds.shape[0] != local_cache_plan.local_num_tokens
+        ):
+            inputs_embeds = _prepare_dsa_cp_local_hidden(inputs_embeds, local_cache_plan)
         current_step_idx = spec_step_idx % self.num_mtp_layers
         return self.layers[str(current_step_idx)](
             input_ids,

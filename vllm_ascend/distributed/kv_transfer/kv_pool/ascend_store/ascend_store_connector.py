@@ -195,7 +195,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         metadata = self._get_connector_metadata()
         logger.debug(
-            "KV pool connector start_load_kv metadata_requests=%d specs=%s",
+            "TEST KV pool connector start_load_kv metadata_requests=%d specs=%s",
             len(metadata.requests),
             [
                 (
@@ -221,19 +221,38 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             return
 
         if self.kv_role == "kv_consumer":
+            logger.debug(
+                "TEST KV pool connector save_kv_layer skipped role=kv_consumer consumer_is_to_put=%s",
+                self.consumer_is_to_put,
+            )
             # Don't do save if the role is kv_consumer
             return
-        self.connector_worker.save_kv_layer(self._get_connector_metadata())
+        metadata = self._get_connector_metadata()
+        logger.debug(
+            "TEST KV pool connector save_kv_layer metadata_requests=%d",
+            len(metadata.requests),
+        )
+        self.connector_worker.save_kv_layer(metadata)
 
     def wait_for_save(self):
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
+            logger.debug(
+                "TEST KV pool connector wait_for_save skipped role=kv_consumer consumer_is_to_put=%s",
+                self.consumer_is_to_put,
+            )
             # Don't do save if the role is kv_consumer
             return
 
         if self.use_layerwise:
+            logger.debug("TEST KV pool connector wait_for_save skipped reason=layerwise")
             return
 
-        self.connector_worker.wait_for_save(self._get_connector_metadata())
+        metadata = self._get_connector_metadata()
+        logger.debug(
+            "TEST KV pool connector wait_for_save metadata_requests=%d",
+            len(metadata.requests),
+        )
+        self.connector_worker.wait_for_save(metadata)
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
@@ -305,7 +324,7 @@ class LookupKeyServer:
                     self.use_layerwise,
                 )
                 logger.debug(
-                    "KV pool lookup response token_len=%d groups=%s hit_tokens=%d",
+                    "TEST KV pool lookup response token_len=%d groups=%s hit_tokens=%d",
                     token_len,
                     kv_group_ids,
                     result,

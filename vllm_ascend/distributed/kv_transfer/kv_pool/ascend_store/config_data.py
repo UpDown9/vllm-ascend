@@ -5,6 +5,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
+import numpy as np
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata, KVConnectorWorkerMetadata
 from vllm.logger import logger
@@ -597,6 +598,12 @@ class RequestTracker:
 
     block_sizes: list[int] | None = None
 
+    last_block_gva: int | None = None
+    block_gvas: list[int]
+    gva_block_offset: int = 0
+    current_chunk_start_token: int = 0
+    current_chunk_end_token: int | None = None
+
     def __init__(
         self,
         req_id: str,
@@ -609,6 +616,11 @@ class RequestTracker:
         mamba_group_ids: list[int] | None = None,
         num_speculative_blocks: int = 0,
         block_sizes: list[int] | None = None,
+        last_block_gva: int | None = None,
+        block_gvas: list[int] | None = None,
+        gva_block_offset: int = 0,
+        current_chunk_start_token: int = 0,
+        current_chunk_end_token: int | None = None,
     ) -> None:
         self.req_id = req_id
         self.token_len = token_len
@@ -622,6 +634,15 @@ class RequestTracker:
         self.token_ids = token_ids
         self.num_prompt_tokens = num_prompt_tokens
         self.block_sizes = block_sizes
+        self.last_block_gva = last_block_gva
+        self.block_gvas = (
+            block_gvas.copy()
+            if block_gvas is not None
+            else self.allocated_block_ids.copy()
+        )
+        self.gva_block_offset = gva_block_offset
+        self.current_chunk_start_token = current_chunk_start_token
+        self.current_chunk_end_token = current_chunk_end_token
 
     @property
     def allocated_block_ids(self) -> list[int]:
@@ -630,6 +651,8 @@ class RequestTracker:
     @allocated_block_ids.setter
     def allocated_block_ids(self, block_ids: list[int] | list[list[int]]) -> None:
         self.allocated_block_ids_by_group = normalize_block_ids_by_group(block_ids)
+        self.block_gvas = self.allocated_block_ids.copy()
+        self.gva_block_offset = 0
 
     @staticmethod
     def from_new_request(
@@ -644,6 +667,8 @@ class RequestTracker:
             allocated_block_ids_by_group=normalize_block_ids_by_group(new_request.block_ids),
             num_saved_tokens=0,
             num_prompt_tokens=len(new_request.prompt_token_ids),
+            current_chunk_start_token=0,
+            current_chunk_end_token=num_tokens_to_compute,
         )
 
     def update(
@@ -660,6 +685,8 @@ class RequestTracker:
         for group_id, ids in enumerate(normalized):
             self.update_mamba_spec_blocks(ids, group_id, num_computed_tokens)
             self.allocated_block_ids_by_group[group_id].extend(ids)
+            if group_id == 0:
+                self.block_gvas.extend(ids)
 
     def update_mamba_spec_blocks(self, block_ids: list[int], kv_cache_group_id: int, num_computed_tokens: int):
         """
@@ -740,6 +767,20 @@ class ReqMeta:
         original_block_size: list[int] | int | None = None,
         block_ids: list[int] | list[list[int]] | None = None,
         event_id: int | None = None,
+        save_end_token: int | None = None,
+        target_token_len: int | None = None,
+        save_start_token: int = 0,
+        last_block_gva: int | None = None,
+        partial_block_index: int | None = None,
+        starts: list[int] | None = None,
+        ends: list[int] | None = None,
+        sizes_per_chunk: list[list[int]] | None = None,
+        block_ids_np: np.ndarray | None = None,
+        block_gvas_np: np.ndarray | None = None,
+        gva_block_offset: int = 0,
+        current_chunk_start_token: int = 0,
+        current_chunk_end_token: int | None = None,
+        dsa_cp_swa_owner_ranges: list[tuple[int, int]] | None = None,
     ) -> None:
         self.req_id = req_id
         self.token_len_chunk = token_len_chunk
@@ -759,6 +800,20 @@ class ReqMeta:
         self.token_ids = token_ids
         self.original_block_size = original_block_size
         self.event_id = event_id
+        self.save_end_token = save_end_token
+        self.target_token_len = target_token_len
+        self.save_start_token = save_start_token
+        self.last_block_gva = last_block_gva
+        self.partial_block_index = partial_block_index
+        self.starts = starts
+        self.ends = ends
+        self.sizes_per_chunk = sizes_per_chunk
+        self.block_ids_np = block_ids_np
+        self.block_gvas_np = block_gvas_np
+        self.gva_block_offset = gva_block_offset
+        self.current_chunk_start_token = current_chunk_start_token
+        self.current_chunk_end_token = current_chunk_end_token
+        self.dsa_cp_swa_owner_ranges = dsa_cp_swa_owner_ranges
 
     @property
     def block_ids(self) -> list[int]:
@@ -767,6 +822,24 @@ class ReqMeta:
     @block_ids.setter
     def block_ids(self, block_ids: list[int] | list[list[int]]) -> None:
         self.block_ids_by_group = normalize_block_ids_by_group(block_ids)
+
+    save_end_token: int | None = None
+    target_token_len: int | None = None
+    save_start_token: int = 0
+    last_block_gva: int | None = None
+    partial_block_index: int | None = None
+
+    starts: list[int] | None = None
+    ends: list[int] | None = None
+
+    sizes_per_chunk: list[list[int]] | None = None
+
+    block_ids_np: np.ndarray | None = None
+    block_gvas_np: np.ndarray | None = None
+    gva_block_offset: int = 0
+    current_chunk_start_token: int = 0
+    current_chunk_end_token: int | None = None
+    dsa_cp_swa_owner_ranges: list[tuple[int, int]] | None = None
 
     @staticmethod
     def from_request_tracker(
@@ -783,7 +856,8 @@ class ReqMeta:
         """Create the request metadata from a request tracker."""
         if block_hashes is None:
             block_hashes = []
-        input_token_len = tracker.token_len
+        target_token_len = tracker.token_len
+        previous_saved_tokens = tracker.num_saved_tokens
 
         # For save operation: do not save if the following condition is met
         # 1. has already been saved before (num_saved_tokens > 0)
@@ -794,17 +868,72 @@ class ReqMeta:
             else 0
         )
         num_tokens_to_save = (
-            (input_token_len // cache_transfer_granularity * cache_transfer_granularity)
+            (target_token_len // cache_transfer_granularity * cache_transfer_granularity)
             if discard_partial_chunks
-            else input_token_len
+            else target_token_len
         )
+        full_block_count = target_token_len // cache_transfer_granularity
+        boundary_without_hash = (
+            target_token_len > 0
+            and target_token_len % cache_transfer_granularity == 0
+            and full_block_count > len(block_hashes)
+        )
+        if boundary_without_hash:
+            num_tokens_to_save = len(block_hashes) * cache_transfer_granularity
+        if tracker.last_block_gva is not None and (
+            target_token_len % cache_transfer_granularity != 0 or boundary_without_hash
+        ):
+            partial_block_index = (
+                full_block_count if target_token_len % cache_transfer_granularity != 0 else full_block_count - 1
+            )
+        else:
+            partial_block_index = None
 
-        skip_save = skip_save or num_tokens_to_save < chunk_boundary
+        input_skip_save = bool(skip_save)
+        save_below_boundary = num_tokens_to_save < chunk_boundary and partial_block_index is None
+        skip_save = skip_save or save_below_boundary
+        logger.debug(
+            "TEST KV pool save meta decision req=%s target_token_len=%d previous_saved_tokens=%d "
+            "granularity=%d chunk_boundary=%d num_tokens_to_save=%d block_hashes=%d "
+            "boundary_without_hash=%s partial_block_index=%s input_skip_save=%s "
+            "save_below_boundary=%s final_skip_save=%s discard_partial_chunks=%s "
+            "has_last_block_gva=%s is_last_chunk=%s load_spec=%s",
+            tracker.req_id,
+            target_token_len,
+            previous_saved_tokens,
+            cache_transfer_granularity,
+            chunk_boundary,
+            num_tokens_to_save,
+            len(block_hashes),
+            boundary_without_hash,
+            partial_block_index,
+            input_skip_save,
+            save_below_boundary,
+            bool(skip_save),
+            discard_partial_chunks,
+            tracker.last_block_gva is not None,
+            is_last_chunk,
+            load_spec is not None,
+        )
         if skip_save and load_spec is None:
+            logger.debug(
+                "TEST KV pool save meta skipped req=%s reason=%s target_token_len=%d "
+                "granularity=%d chunk_boundary=%d num_tokens_to_save=%d block_hashes=%d",
+                tracker.req_id,
+                "force_skip_save" if input_skip_save else "below_chunk_boundary",
+                target_token_len,
+                cache_transfer_granularity,
+                chunk_boundary,
+                num_tokens_to_save,
+                len(block_hashes),
+            )
             return None
 
         if not skip_save:
-            tracker.num_saved_tokens = num_tokens_to_save
+            tracker.num_saved_tokens = max(
+                tracker.num_saved_tokens,
+                num_tokens_to_save,
+            )
 
         token_ids = None
         if tracker.token_ids:
@@ -812,38 +941,105 @@ class ReqMeta:
 
         if load_spec is not None and load_spec.can_load:
             logger.debug(
-                "Scheduled to load %d tokens for request %s",
+                "TEST Scheduled to load %d tokens for request %s",
                 load_spec.kvpool_cached_tokens,
                 tracker.req_id,
             )
         else:
             load_spec = None
-        logger.debug("request:%s, meta save spec:%s, meta load spec:%s", tracker.req_id, not skip_save, load_spec)
+        logger.debug("TEST request:%s, meta save spec:%s, meta load spec:%s", tracker.req_id, not skip_save, load_spec)
         return ReqMeta(
             req_id=tracker.req_id,
             token_len_chunk=num_tokens_to_save,
+            save_end_token=num_tokens_to_save,
+            target_token_len=target_token_len,
+            save_start_token=previous_saved_tokens,
             block_ids_by_group=tracker.allocated_block_ids_by_group,
             can_save=not skip_save,
             load_spec=load_spec,
             block_hashes=block_hashes,
             is_last_chunk=is_last_chunk,
             token_ids=token_ids,
-            num_prompt_tokens=tracker.num_prompt_tokens or input_token_len,
             original_block_size=original_block_size,
+            last_block_gva=tracker.last_block_gva,
+            partial_block_index=partial_block_index,
+            block_ids_np=np.asarray(tracker.allocated_block_ids, dtype=np.int64),
+            block_gvas_np=np.asarray(tracker.block_gvas, dtype=np.int64),
+            gva_block_offset=tracker.gva_block_offset,
+            current_chunk_start_token=tracker.current_chunk_start_token,
+            current_chunk_end_token=tracker.current_chunk_end_token,
             kv_cache_group_ids=list(range(len(tracker.allocated_block_ids_by_group))),
             kv_cache_families_by_group=kv_cache_group_families,
         )
 
-
 class AscendConnectorMetadata(KVConnectorMetadata):
-    def __init__(self, unfinished_request_ids, preempted_req_ids):
-        self.requests = []
+    def __init__(
+        self,
+        unfinished_request_ids,
+        preempted_req_ids,
+        loading_req_ids: set[str] | None = None,
+        delayed_free_req_ids: set[str] | None = None,
+    ):
+        self.requests: list[ReqMeta] = []
         self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids
+        self.loading_req_ids = loading_req_ids or set()
+        self.delayed_free_req_ids = delayed_free_req_ids or set()
+        # Populated by the model runner after its persistent batch has been
+        # updated. The order and query lengths must match query_start_loc so
+        # new DSA CP can reproduce the flattened local-cache layout when
+        # selecting the rank that puts each SWA Store block.
+        self.dsa_cp_batch_layout: list[tuple[str, int]] | None = None
 
     def add_request(self, req_meta: ReqMeta) -> None:
         """Add a request to the metadata."""
         self.requests.append(req_meta)
+
+
+@dataclass
+class LayerBatchReqMeta:
+    req_ids: list[str]
+    layer_id: int
+    is_last_chunks: list[bool | None] = field(default_factory=list)
+    addr_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    size_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    gvas_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+
+
+@dataclass
+class LayerBlockRange:
+    request: ReqMeta
+    start_block: int
+    end_block: int
+    partial_block_index: int | None = None
+
+
+@dataclass
+class SharedBlockData:
+    """Pre-computed block data shared across all layers for the same request."""
+
+    block_ids_arr: np.ndarray
+    block_gvas_arr: np.ndarray
+    req_ids: list[str]
+    is_last_chunks: list[bool | None]
+
+
+@dataclass
+class LayerTransferTask:
+    layer_id: int
+    block_ranges: list[LayerBlockRange]
+    shared_block_data: SharedBlockData | None = None
+    # Cache for KVCacheStoreKeyLayerSendingThread:
+    # maps block_range index -> list of (start, end, key_all_layers)
+    cached_process_tokens: dict[int, list[tuple[int, int, list]]] | None = None
+
+
+@dataclass
+class LayerLoadTask:
+    wait_for_save_layer: int | None
+    transfer_tasks: list[LayerTransferTask]
+    layer_id: int
+    attention_start_gate: Any | None = None
 
 
 @dataclass(init=False)

@@ -381,7 +381,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         if self.multistream_overlap_gate:
             assert PrepareAndFinalize.quant_stream is not None
             PrepareAndFinalize.quant_stream.wait_stream(torch.npu.current_stream())
-            with npu_stream_switch(PrepareAndFinalize.quant_stream, enabled=self.multistream_overlap_gate):
+            with npu_stream_switch(PrepareAndFinalize.quant_stream, enabled=True):
                 hidden_states = fc3_all_gather_and_maybe_unpad_impl(hidden_states)
         else:
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, True, True)
@@ -394,7 +394,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         if pertoken_scale is not None:
             pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(pertoken_scale, True, True)
 
-        if self.multistream_overlap_gate:
+        if use_multistream_overlap_gate:
             torch.npu.current_stream().wait_stream(PrepareAndFinalize.quant_stream)
 
         if self.moe_config.pcp_size > 1:

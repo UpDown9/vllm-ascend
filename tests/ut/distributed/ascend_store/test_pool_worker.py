@@ -16,6 +16,7 @@
 #
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
@@ -132,6 +133,44 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         self.assertEqual(hit, 128)
         worker.cache_coordinator.find_longest_cache_hit.assert_called_once()
         self.assertFalse(worker.cache_coordinator.find_longest_cache_hit.call_args.kwargs["apply_eagle"])
+
+    def test_infer_group_uses_swa_excludes_dsv4_state_caches(self):
+        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.use_dsa_cp_local_cache = True
+        c4_state_spec = SimpleNamespace(
+            sliding_window=512,
+            state_compress_ratio=4,
+        )
+        c4_state_group_spec = UniformTypeKVCacheSpecs.from_specs(
+            {"c4_state": c4_state_spec}
+        )
+        worker.kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    kv_cache_spec=SimpleNamespace(
+                        sliding_window=4096,
+                        state_compress_ratio=1,
+                    )
+                ),
+                SimpleNamespace(
+                    layer_names=["c4_state"],
+                    kv_cache_spec=c4_state_group_spec,
+                ),
+                SimpleNamespace(
+                    kv_cache_spec=SimpleNamespace(
+                        sliding_window=16384,
+                        state_compress_ratio=128,
+                    )
+                ),
+            ]
+        )
+
+        self.assertEqual(worker._infer_group_uses_swa(), [True, False, False])
+        worker.use_dsa_cp_local_cache = False
+        self.assertEqual(worker._infer_group_uses_swa(), [True, True, True])
 
 
 class TestKVPoolWorkerInit(unittest.TestCase):

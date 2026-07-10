@@ -32,6 +32,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 
+
 class BudgetRefiner:
     """This budget refiner can make dynamic adjustment to the token budget
     in the chunked prefill scheduling strategy."""

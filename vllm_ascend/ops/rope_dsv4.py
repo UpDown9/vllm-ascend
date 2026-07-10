@@ -59,6 +59,47 @@ class RopeDataProxy:
             return layer_result
 
 
+def resolve_rope_tensor(
+    rope_data: torch.Tensor | RopeDataProxy,
+    layer_name: str,
+) -> torch.Tensor:
+    """Resolve deferred RoPE data for a layer while preserving Tensor inputs."""
+    if isinstance(rope_data, torch.Tensor):
+        return rope_data
+
+    resolved = rope_data[layer_name]
+    if not isinstance(resolved, torch.Tensor):
+        raise RuntimeError(
+            f"Expected one RoPE tensor for layer {layer_name}, got {type(resolved).__name__}."
+        )
+    return resolved
+
+
+def concatenate_tensor_slices(
+    tensor: torch.Tensor,
+    ranges: tuple[tuple[int, int], ...],
+) -> torch.Tensor:
+    """Concatenate flattened-token ranges from an already resolved RoPE tensor."""
+    return torch.cat([tensor[start:end] for start, end in ranges], dim=0)
+
+
+def concatenate_rope_slices(
+    rope_data: RopeDataProxy,
+    ranges: tuple[tuple[int, int], ...],
+) -> tuple[RopeDataProxy, RopeDataProxy]:
+    """Concatenate token ranges while preserving deferred per-layer RoPE lookup."""
+    concatenated_data: dict[Any, Any] = {}
+    for config_key, groups_map in rope_data._data.items():
+        concatenated_data[config_key] = {}
+        for group_name, (cos, sin) in groups_map.items():
+            concatenated_data[config_key][group_name] = (
+                concatenate_tensor_slices(cos, ranges),
+                concatenate_tensor_slices(sin, ranges),
+            )
+
+    return RopeDataProxy(concatenated_data, is_cos=True), RopeDataProxy(concatenated_data, is_cos=False)
+
+
 def get_cos_and_sin_dsa(
     positions: torch.Tensor | dict[str, torch.Tensor],
     use_cache: bool = False,

@@ -24,6 +24,7 @@ from vllm_ascend.ops.vocab_parallel_embedding import (
     AscendLogitsProcessor,
     AscendParallelLMHead,
     AscendVocabParallelEmbedding,
+    _use_dsa_cp_local_cache,
 )
 
 VOCAB_PARALLEL_EMBEDDING_TEST_NUM_RANDOM_SEEDS = 128
@@ -200,6 +201,32 @@ class TestCustomVocabParallelEmbedding(unittest.TestCase):
                     # Call the forward method
                     output = layer.forward(input_)
                 self.assertEqual(output.shape, expected_shape)
+
+    def test_dsa_cp_local_cache_embedding_layout_is_used_by_target_and_draft(self):
+        local_cache_plan = object()
+        metadata = MagicMock()
+        metadata.req_metadata.cp_metadata.local_cache_plan = local_cache_plan
+
+        target_context = MagicMock(
+            is_draft_model=False,
+            attn_metadata={"layer": metadata},
+        )
+        draft_context = MagicMock(
+            is_draft_model=True,
+            attn_metadata={"layer": metadata},
+        )
+
+        with patch(
+            "vllm_ascend.ascend_forward_context.get_forward_context",
+            return_value=target_context,
+        ):
+            self.assertTrue(_use_dsa_cp_local_cache())
+
+        with patch(
+            "vllm_ascend.ascend_forward_context.get_forward_context",
+            return_value=draft_context,
+        ):
+            self.assertTrue(_use_dsa_cp_local_cache())
 
 
 class TestAscendLogitsProcessor(unittest.TestCase):

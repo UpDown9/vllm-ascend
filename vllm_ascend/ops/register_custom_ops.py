@@ -70,10 +70,17 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
     return x
 
 
-def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> torch.Tensor:
+def _maybe_pad_and_reduce_impl(
+    x: torch.Tensor,
+    is_ep_comm: bool = False,
+    preserve_full_tokens: bool = False,
+) -> torch.Tensor:
     try:
         forward_context = get_forward_context()
     except AssertionError:
+        return tensor_model_parallel_all_reduce(x)
+
+    if preserve_full_tokens:
         return tensor_model_parallel_all_reduce(x)
 
     flash_comm_v1_enabled = getattr(forward_context, "flash_comm_v1_enabled", False) or (
@@ -114,7 +121,13 @@ def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor, label: bool, is_ep_c
     return x
 
 
-def _maybe_pad_and_reduce_fake(x: torch.Tensor, is_ep_comm: bool = False) -> torch.Tensor:
+def _maybe_pad_and_reduce_fake(
+    x: torch.Tensor,
+    is_ep_comm: bool = False,
+    preserve_full_tokens: bool = False,
+) -> torch.Tensor:
+    if preserve_full_tokens:
+        return torch.empty_like(x)
     if _EXTRA_CTX.flash_comm_v1_enabled or enable_sp_by_pass():
         return torch.empty(
             (x.shape[0] // get_tensor_model_parallel_world_size(), *x.shape[1:]), device=x.device, dtype=x.dtype

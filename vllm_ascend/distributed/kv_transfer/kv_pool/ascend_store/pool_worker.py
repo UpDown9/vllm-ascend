@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
     AscendStoreKVConnectorWorkerMetadata,
@@ -39,6 +40,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import
     ExternalCachedBlockPool,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+    DSA_CP_PREFIX_CACHE_UNIT_SIZE,
     KVCacheStoreLayerRecvingThread,
     KVCacheStoreLayerSendingThread,
     KVCacheStoreRecvingThread,
@@ -128,19 +130,21 @@ class KVPoolWorker:
         self.lcm_block_size = math.lcm(*self.grouped_block_size)
         self.num_kv_cache_groups = len(self.grouped_block_size)
         self.kv_cache_group_families = self._infer_group_families()
+        self.use_dsa_cp_local_cache = self._uses_dsa_cp_local_cache(vllm_config)
         self.group_uses_align_state = self._infer_group_uses_align_state()
+        self.group_uses_swa = self._infer_group_uses_swa()
         self.cache_transfer_granularity = self._infer_cache_transfer_granularity()
         if self.use_layerwise and self.num_kv_cache_groups > 1:
             raise NotImplementedError("AscendStore layerwise mode does not yet support hybrid KV cache groups.")
 
-        logger.info(
-            "use_hybrid: %s, use_mamba: %s, num_kv_cache_groups: %s, hash_block_size: %s, lcm_block_size: %s",
-            self.use_hybrid,
-            self.use_mamba,
-            self.num_kv_cache_groups,
-            self.hash_block_size,
-            self.lcm_block_size,
-        )
+        # logger.info(
+        #     "use_hybrid: %s, use_mamba: %s, num_kv_cache_groups: %s, hash_block_size: %s, lcm_block_size: %s",
+        #     self.use_hybrid,
+        #     self.use_mamba,
+        #     self.num_kv_cache_groups,
+        #     self.hash_block_size,
+        #     self.lcm_block_size,
+        # )
         self.current_layer = 0
         self.num_layers = model_config.get_num_layers(parallel_config)
 
@@ -155,6 +159,34 @@ class KVPoolWorker:
         else:
             self.head_or_tp_rank = self.tp_rank
             self.put_step = 1
+
+        logger.debug(
+            "TEST KV pool worker config role=%s backend=%s use_layerwise=%s use_compress=%s "
+            "use_hybrid=%s grouped_block_size=%s original_block_size=%s hash_block_size=%s "
+            "cache_transfer_granularity=%d tp_rank=%d tp_size=%d pcp_rank=%d pcp_size=%d "
+            "dcp_rank=%d dcp_size=%d put_step=%d num_layers=%d kv_groups=%d "
+            "families=%s use_dsa_cp_local_cache=%s",
+            self.kv_role,
+            self.backend,
+            self.use_layerwise,
+            self.use_compress,
+            self.use_hybrid,
+            self.grouped_block_size,
+            self.original_block_size,
+            self.hash_block_size,
+            self.cache_transfer_granularity,
+            self.tp_rank,
+            self.tp_size,
+            self.pcp_rank,
+            self.pcp_size,
+            self.dcp_rank,
+            self.dcp_size,
+            self.put_step,
+            self.num_layers,
+            self.num_kv_cache_groups,
+            self.kv_cache_group_families,
+            self.use_dsa_cp_local_cache,
+        )
 
         partitions = None
         if self.kv_role == "kv_consumer" and self.consumer_is_to_put:
@@ -229,6 +261,138 @@ class KVPoolWorker:
 
         self.finished_store_req: set[str] = set()
 
+
+    @staticmethod
+    def _uses_dsa_cp_local_cache(vllm_config: VllmConfig) -> bool:
+        additional_config = vllm_config.additional_config or {}
+        model_config = vllm_config.model_config
+        hf_text_config = getattr(model_config, "hf_text_config", None)
+        hf_config = getattr(model_config, "hf_config", hf_text_config)
+        hf_config = hf_text_config or hf_config
+        return (
+            getattr(hf_config, "model_type", None) == "deepseek_v4"
+            and additional_config.get("enable_dsa_cp", False)
+            and ascend_envs.VLLM_ASCEND_ENABLE_DSA_CP_LOCAL_CACHE
+        )
+
+    @staticmethod
+    def _ceil_to_dsa_cp_unit(num_tokens: int) -> int:
+        if num_tokens <= 0:
+            return 0
+        return (
+            (num_tokens + DSA_CP_PREFIX_CACHE_UNIT_SIZE - 1)
+            // DSA_CP_PREFIX_CACHE_UNIT_SIZE
+            * DSA_CP_PREFIX_CACHE_UNIT_SIZE
+        )
+
+    def _assign_dsa_cp_swa_owner_ranges_for_save_batch(
+        self,
+        requests: list[ReqMeta],
+        batch_layout: list[tuple[str, int]] | None = None,
+    ) -> None:
+        if not any(self.group_uses_swa):
+            return
+
+        save_requests = [request for request in requests if request.can_save is not None and request.can_save]
+        if not save_requests:
+            return
+
+        if self.use_dsa_cp_local_cache and batch_layout is not None:
+            request_spans: dict[str, tuple[int, int, int]] = {}
+            padded_total = 0
+            for req_id, chunk_len in batch_layout:
+                chunk_len = max(0, int(chunk_len))
+                padded_len = self._ceil_to_dsa_cp_unit(chunk_len)
+                if req_id in request_spans:
+                    raise RuntimeError(
+                        "DSA CP local-cache batch layout contains duplicate "
+                        f"request ID {req_id}."
+                    )
+                request_spans[req_id] = (
+                    padded_total,
+                    padded_total + padded_len,
+                    chunk_len,
+                )
+                padded_total += padded_len
+
+            owner_start, owner_end = KVCacheStoreSendingThread._get_dsa_cp_owner_range(
+                padded_total, self.tp_size, self.tp_rank
+            )
+            for request in save_requests:
+                chunk_start = request.current_chunk_start_token
+                chunk_end = (
+                    request.current_chunk_end_token
+                    or request.target_token_len
+                    or request.token_len_chunk
+                )
+                chunk_end = max(chunk_start, chunk_end)
+                chunk_len = chunk_end - chunk_start
+                span = request_spans.get(request.req_id)
+                if span is None:
+                    raise RuntimeError(
+                        "DSA CP local-cache batch layout is missing Store "
+                        f"request {request.req_id}."
+                    )
+                padded_start, padded_end, layout_chunk_len = span
+                if layout_chunk_len != chunk_len:
+                    raise RuntimeError(
+                        "DSA CP local-cache query length mismatch for request "
+                        f"{request.req_id}: model batch has {layout_chunk_len}, "
+                        f"Store metadata has {chunk_len}."
+                    )
+
+                overlap_start = max(owner_start, padded_start)
+                overlap_end = min(owner_end, padded_end)
+                local_start = min(max(overlap_start - padded_start, 0), chunk_len)
+                local_end = min(max(overlap_end - padded_start, 0), chunk_len)
+                real_start = max(chunk_start + local_start, request.save_start_token)
+                real_end = min(
+                    chunk_start + local_end,
+                    request.save_end_token
+                    if request.save_end_token is not None
+                    else request.token_len_chunk,
+                )
+                request.dsa_cp_swa_owner_ranges = [(real_start, real_end)] if real_start < real_end else []
+                # logger.info(
+                #     "TEST DSA CP local-cache SWA put owner req=%s tp_rank=%d tp_size=%d "
+                #     "chunk=[%d,%d) save=[%d,%s) owner=%s",
+                #     request.req_id,
+                #     self.tp_rank,
+                #     self.tp_size,
+                #     chunk_start,
+                #     chunk_end,
+                #     request.save_start_token,
+                #     request.save_end_token,
+                #     request.dsa_cp_swa_owner_ranges,
+                # )
+            return
+
+        if self.pcp_size * self.dcp_size <= 1:
+            return
+
+        cp_size = self.pcp_size * self.dcp_size
+        cp_rank = self.pcp_rank * self.dcp_size + self.dcp_rank
+        request_spans: list[tuple[ReqMeta, int, int, int]] = []
+        padded_total = 0
+        for request in save_requests:
+            token_len = request.token_len_chunk
+            padded_len = self._ceil_to_dsa_cp_unit(token_len)
+            request_spans.append((request, token_len, padded_total, padded_total + padded_len))
+            padded_total += padded_len
+
+        owner_start, owner_end = KVCacheStoreSendingThread._get_dsa_cp_owner_range(
+            padded_total, cp_size, cp_rank
+        )
+        for request, token_len, padded_start, padded_end in request_spans:
+            start = max(owner_start, padded_start)
+            end = min(owner_end, padded_end)
+            if start >= end:
+                request.dsa_cp_swa_owner_ranges = []
+                continue
+            real_start = min(start - padded_start, token_len)
+            real_end = min(end - padded_start, token_len)
+            request.dsa_cp_swa_owner_ranges = [(real_start, real_end)] if real_start < real_end else []
+
     def _build_cache_coordinator(self, vllm_config: VllmConfig) -> AscendStoreCoordinator | None:
         if self.kv_cache_config is None or not self.use_hybrid:
             return None
@@ -285,6 +449,36 @@ class KVPoolWorker:
                 )
             )
         return group_uses_align_state
+
+    def _infer_group_uses_swa(self) -> list[bool]:
+        if self.kv_cache_config is None:
+            return [False]
+
+        group_uses_swa: list[bool] = []
+        for group in self.kv_cache_config.kv_cache_groups:
+            kv_cache_spec = group.kv_cache_spec
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                specs = [kv_cache_spec.kv_cache_specs[layer_name] for layer_name in group.layer_names]
+            else:
+                specs = [kv_cache_spec]
+            group_uses_swa.append(
+                any(
+                    (
+                        spec.__class__.__name__ == "SlidingWindowSpec"
+                        or getattr(spec, "sliding_window", None) is not None
+                    )
+                    # Under local-cache CP, DeepSeek-V4 state groups are
+                    # replicated at Store boundaries and must use normal TP
+                    # interleaved put instead of owner-only SWA put. Preserve
+                    # the legacy classification outside this new CP path.
+                    and (
+                        not self.use_dsa_cp_local_cache
+                        or getattr(spec, "state_compress_ratio", 1) <= 1
+                    )
+                    for spec in specs
+                )
+            )
+        return group_uses_swa
 
     def _get_group_block_size(self, group_id: int) -> int:
         if group_id >= len(self.grouped_block_size):
@@ -502,6 +696,9 @@ class KVPoolWorker:
                     ready_event_sending,
                     self.group_uses_align_state,
                     self.enable_kv_events,
+                    self.group_uses_swa,
+                    self.pcp_rank * self.dcp_size + self.dcp_rank,
+                    self.pcp_size * self.dcp_size,
                 )
                 self.kv_send_thread.start()
             if self.load_async:
@@ -522,7 +719,7 @@ class KVPoolWorker:
     def start_load_kv(self, metadata: AscendConnectorMetadata):
         self.current_layer = 0
         self.layerwise_retrievers = []
-        logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
+        logger.debug("TEST KV pool worker start_load_kv requests=%d", len(metadata.requests))
         for request in metadata.requests:
             load_spec = request.load_spec
             if load_spec is None or not load_spec.can_load:  # load =0
@@ -543,7 +740,7 @@ class KVPoolWorker:
                 token_len = request.load_spec.kvpool_cached_tokens
             request.load_spec.token_len = token_len
             logger.debug(
-                "KV pool worker prepare get req=%s token_len_chunk=%d get_token_len=%d "
+                "TEST KV pool worker prepare get req=%s token_len_chunk=%d get_token_len=%d "
                 "vllm_cached=%d kvpool_cached=%d groups=%s load_async=%s",
                 request.req_id,
                 request.token_len_chunk,
@@ -605,14 +802,31 @@ class KVPoolWorker:
                     + block_id_list[: self.tp_rank % len(block_id_list)]
                 )
                 logger.debug(
-                    "KV pool worker calls backend get request=%s token_len=%d groups=%s keys=%d sample_keys=%s",
+                    "TEST KV pool worker calls backend get request=%s token_len=%d groups=%s keys=%d sample_keys=%s",
                     request.req_id,
                     token_len,
                     load_group_ids,
                     len(key_list_c),
                     key_list_c[:3],
                 )
+                # logger.info(
+                #     "[KV-STORE-TRACE] operation=load request_id=%s mode=sync "
+                #     "groups=%s tp_rank=%d keys=%s",
+                #     request.req_id,
+                #     load_group_ids,
+                #     self.tp_rank,
+                #     key_list_c,
+                # )
                 ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+                # logger.info(
+                #     "[KV-STORE-TRACE] operation=load_result request_id=%s "
+                #     "mode=sync tp_rank=%d key_status=%s",
+                #     request.req_id,
+                #     self.tp_rank,
+                #     list(zip(key_list_c, ret, strict=False))
+                #     if ret is not None
+                #     else None,
+                # )
                 if ret is not None and any(r != 0 for r in ret):
                     missing_block_ids = record_failed_blocks(
                         block_id_list_c,
@@ -644,7 +858,7 @@ class KVPoolWorker:
                             missing_block_ids,
                         )
                 logger.debug(
-                    "KV pool worker backend get returned request=%s token_len=%d groups=%s keys=%d",
+                    "TEST KV pool worker backend get returned request=%s token_len=%d groups=%s keys=%d",
                     request.req_id,
                     token_len,
                     load_group_ids,
@@ -706,16 +920,39 @@ class KVPoolWorker:
         for request in connector_metadata.requests:
             can_save = request.can_save
             if can_save is None or not can_save:
+                logger.debug(
+                    "TEST KV pool wait_for_save skip req=%s can_save=%s token_len=%s",
+                    request.req_id,
+                    can_save,
+                    request.token_len_chunk,
+                )
                 continue
             current_event = torch.npu.Event()
             current_event.record()
             break
+
+        self._assign_dsa_cp_swa_owner_ranges_for_save_batch(
+            connector_metadata.requests,
+            connector_metadata.dsa_cp_batch_layout,
+        )
 
         for request in connector_metadata.requests:
             can_save = request.can_save
             if can_save is None or not can_save:
                 continue
 
+            logger.debug(
+                "TEST KV pool wait_for_save enqueue req=%s token_len=%d save_start=%d "
+                "save_end=%s target_token_len=%s is_last_chunk=%s block_hashes=%d block_groups=%s",
+                request.req_id,
+                request.token_len_chunk,
+                request.save_start_token,
+                request.save_end_token,
+                request.target_token_len,
+                request.is_last_chunk,
+                len(request.block_hashes),
+                [len(blocks) for blocks in request.block_ids_by_group],
+            )
             request.skip_null_blocks_by_group = self.group_uses_align_state
             request.current_event = current_event
             self.kv_send_thread.add_stored_request(  # type: ignore[union-attr]
@@ -725,6 +962,12 @@ class KVPoolWorker:
                 request,
             )
             has_save_request = True
+
+        if not has_save_request:
+            logger.debug(
+                "TEST KV pool wait_for_save no save requests metadata_requests=%d",
+                len(connector_metadata.requests),
+            )
 
         if has_save_request:
             # vLLM expects wait_for_save() to make stores visible before the
@@ -845,6 +1088,15 @@ class KVPoolWorker:
             ends.append(end)
             keys.append(keys_multi_layer)  # [block_num,layer_num]
 
+        logger.debug(
+            "TEST KV pool store_layer req=%s token_len=%d layerwise_blocks=%d block_hashes=%d "
+            "is_last_chunk=%s",
+            request.req_id,
+            request.token_len_chunk,
+            len(keys),
+            len(request.block_hashes),
+            request.is_last_chunk,
+        )
         if keys:
             keys = [list(row) for row in zip(*keys)]  # [layer_num,block_num]
             for layer_id, keys_multi_chunk in enumerate(keys):
@@ -1110,7 +1362,7 @@ class KVPoolWorker:
             apply_eagle=False,
         )
         logger.debug(
-            "KV pool coordinator lookup final token_len=%d groups=%s hit=%d",
+            "TEST KV pool coordinator lookup final token_len=%d groups=%s hit=%d",
             token_len,
             kv_cache_group_ids,
             hit_length,
@@ -1190,7 +1442,7 @@ class KVPoolWorker:
                     for i in range(group_tp_size * self.pp_size)
                 ]
                 logger.debug(
-                    "KV pool lookup request token_len=%d group=%d keys=%d multi_tp_keys=%d "
+                    "TEST KV pool lookup request token_len=%d group=%d keys=%d multi_tp_keys=%d "
                     "exists_count=%d/%d exists_sample=%s sample_keys=%s",
                     token_len,
                     group_id,
@@ -1214,7 +1466,7 @@ class KVPoolWorker:
                 max_hit_position = min(max_hit_position, group_hits[-1])
                 hits.append(group_hits)
                 logger.debug(
-                    "KV pool scheduler lookup group=%d keys=%d hit=%d token_len=%d",
+                    "TEST KV pool scheduler lookup group=%d keys=%d hit=%d token_len=%d",
                     group_id,
                     len(keys),
                     max_hit_position,
@@ -1229,7 +1481,7 @@ class KVPoolWorker:
             return 0
         final_hits = self._max_intersection_hit_position(hits)
         logger.debug(
-            "KV pool scheduler lookup final token_len=%d groups=%s hit=%d",
+            "TEST KV pool scheduler lookup final token_len=%d groups=%s hit=%d",
             token_len,
             kv_cache_group_ids,
             final_hits,

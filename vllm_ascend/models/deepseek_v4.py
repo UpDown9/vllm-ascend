@@ -41,6 +41,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
@@ -72,6 +73,7 @@ from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache as VllmDeepseekV4SWACache
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
@@ -105,6 +107,44 @@ def _dsv4_block_sizes():
     return DSV4_BLOCK_SIZES
 
 
+def _get_dsa_cp_local_cache_plan():
+    from vllm_ascend.attention.context_parallel.dsa_cp import (
+        find_dsa_cp_local_cache_plan,
+    )
+    from vllm_ascend.ascend_forward_context import get_forward_context
+
+    forward_ctx = get_forward_context()
+    if forward_ctx is None:
+        return None
+    return find_dsa_cp_local_cache_plan(
+        getattr(forward_ctx, "attn_metadata", None)
+    )
+
+
+def _prepare_dsa_cp_local_hidden(hidden_states: torch.Tensor, local_cache_plan) -> torch.Tensor:
+    """Convert the model input to the local-cache CP token layout once.
+
+    The embedding communication preserves the full flattened token view for
+    this opt-in path. Select the per-request 128-token-unit ranges assigned to
+    this rank before entering the first transformer layer.
+    """
+    if local_cache_plan is None:
+        return hidden_states
+    from vllm_ascend.attention.context_parallel.dsa_cp import select_dsa_cp_local_tokens
+
+    return select_dsa_cp_local_tokens(hidden_states, local_cache_plan)
+
+
+def _gather_dsa_cp_local_hidden(hidden_states: torch.Tensor, local_cache_plan) -> torch.Tensor:
+    if local_cache_plan is None or local_cache_plan.cp_size <= 1:
+        return hidden_states
+    if hidden_states.shape[0] != local_cache_plan.local_num_tokens:
+        return hidden_states
+    from vllm_ascend.attention.context_parallel.dsa_cp import gather_dsa_cp_local_tokens
+
+    return gather_dsa_cp_local_tokens(hidden_states, local_cache_plan)
+
+
 class AscendCompressorStateCache(CompressorStateCache):
     def __init__(
         self,
@@ -130,6 +170,7 @@ class AscendCompressorStateCache(CompressorStateCache):
             sliding_window=self.sliding_window,
             alignment=None,
             page_size_padded=page_size_padded,
+            state_compress_ratio=self.compress_ratio,
         )
 
     def forward(self): ...
@@ -461,11 +502,18 @@ class DeepseekV4MoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        # Local-cache DSA CP has already selected this rank's variable-length
+        # token ranges. Do not apply legacy SP chunk/gather a second time.
+        local_cache_plan = _get_dsa_cp_local_cache_plan()
+        use_legacy_sequence_parallel = (
+            self.is_sequence_parallel and local_cache_plan is None
+        )
+
         # Chunk the hidden states so they aren't replicated across TP ranks.
         # This avoids duplicate computation in self.experts.
         # TODO: We can replace the all_reduce at the end of attn with a
         # reduce_scatter instead of chunking here.
-        if self.is_sequence_parallel:
+        if use_legacy_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         if self.experts.is_internal_router:
@@ -499,10 +547,14 @@ class DeepseekV4MoE(nn.Module):
         else:
             final_hidden_states = fused_moe_out
 
-        if self.is_sequence_parallel:
+        if use_legacy_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, 0)
             final_hidden_states = final_hidden_states[:num_tokens]
-        elif self.tp_size > 1 and fused_moe_out_is_tuple:
+        elif (
+            local_cache_plan is None
+            and self.tp_size > 1
+            and fused_moe_out_is_tuple
+        ):
             # Legacy tuple outputs are reduced here. Tensor outputs from the
             # upstream MoERunner have already gone through its final reduction.
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
@@ -1085,6 +1137,8 @@ class DeepseekV4Model(nn.Module):
             dtype=vllm_config.model_config.dtype,
             device=self.device,
         )
+        self._mtp_hidden_num_tokens = 0
+        self._mtp_hidden_is_local = False
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1128,31 +1182,52 @@ class DeepseekV4Model(nn.Module):
         else:
             llama_4_scaling = None
 
+        hidden_states = _prepare_dsa_cp_local_hidden(hidden_states, _get_dsa_cp_local_cache_plan())
         if get_pp_group().is_first_rank:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
-        # When FlashComm1 (sequence parallelism) is enabled, tokens are
-        # partitioned across TP ranks via reduce_scatter in each layer's
-        # row-parallel output projection.  We must all_gather here so the
-        # MTP layers receive the full token set — otherwise only rank 0's
-        # partition is valid and the rest of the buffer holds stale data,
-        # leading to NaN values and low acceptance rate.
+        # With compact output enabled, local-cache CP writes its owner-only
+        # token shard directly for the MTP proposer. The legacy path restores
+        # global request order before writing this buffer.
         from vllm_ascend.ascend_forward_context import get_forward_context
 
         forward_ctx = get_forward_context()
-        if forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
+        if forward_ctx is not None:
+            # Forward contexts may be reused, so this is a per-call marker.
+            forward_ctx.dsa_cp_local_cache_output_gathered = False
+            forward_ctx.dsa_cp_local_cache_output_sharded = False
+        local_cache_plan = _get_dsa_cp_local_cache_plan()
+        if local_cache_plan is not None and hidden_states.shape[0] == local_cache_plan.local_num_tokens:
+            if ascend_envs.VLLM_ASCEND_ENABLE_DSA_CP_COMPACT_OUTPUT:
+                if forward_ctx is not None:
+                    forward_ctx.dsa_cp_local_cache_output_sharded = True
+            else:
+                hidden_states = _gather_dsa_cp_local_hidden(hidden_states, local_cache_plan)
+                if forward_ctx is not None:
+                    forward_ctx.dsa_cp_local_cache_output_gathered = True
+            num_tokens = hidden_states.shape[0]
+            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+            self._mtp_hidden_num_tokens = num_tokens
+            self._mtp_hidden_is_local = bool(
+                ascend_envs.VLLM_ASCEND_ENABLE_DSA_CP_COMPACT_OUTPUT
+            )
+        elif forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
             h_states_flat = tensor_model_parallel_all_gather(hidden_states.flatten(1), dim=0)
             pad_size = forward_ctx.pad_size
             if pad_size > 0:
                 h_states_flat = h_states_flat[:-pad_size]
             num_tokens = h_states_flat.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(h_states_flat)
+            self._mtp_hidden_num_tokens = num_tokens
+            self._mtp_hidden_is_local = False
         else:
             num_tokens = hidden_states.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+            self._mtp_hidden_num_tokens = num_tokens
+            self._mtp_hidden_is_local = False
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -1305,7 +1380,12 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         """Pre-hc_head residual stream buffer (max_num_batched_tokens,
         hc_mult * hidden_size) for the MTP draft model. Populated by
         forward(); valid after each target step."""
-        return getattr(self.model, "_mtp_hidden_buffer", None)
+        buffer = getattr(self.model, "_mtp_hidden_buffer", None)
+        if buffer is None:
+            return None
+        if getattr(self.model, "_mtp_hidden_is_local", False):
+            return buffer[: self.model._mtp_hidden_num_tokens]
+        return buffer
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         rocm_aiter_moe_shared_expert_enabled = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()

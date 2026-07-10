@@ -42,6 +42,7 @@ from vllm.v1.spec_decode.utils import (
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -76,6 +77,45 @@ def patch_tensor_parallel_group(tp_group):
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
+
+
+def _get_dsa_cp_local_cache_plan():
+    from vllm_ascend.attention.context_parallel.dsa_cp import (
+        find_dsa_cp_local_cache_plan,
+    )
+
+    forward_context = get_forward_context()
+    if forward_context is None:
+        return None
+    return find_dsa_cp_local_cache_plan(
+        getattr(forward_context, "attn_metadata", None)
+    )
+
+
+def _select_dsa_cp_local_tokens(tensor: torch.Tensor | None, local_cache_plan):
+    if tensor is None:
+        return None
+    from vllm_ascend.attention.context_parallel.dsa_cp import select_dsa_cp_local_tokens
+
+    return select_dsa_cp_local_tokens(tensor, local_cache_plan)
+
+
+def _ensure_dsa_cp_local_tokens(tensor: torch.Tensor | None, local_cache_plan):
+    if tensor is None or tensor.shape[0] == local_cache_plan.local_num_tokens:
+        return tensor
+    return _select_dsa_cp_local_tokens(tensor, local_cache_plan)
+
+
+def _gather_dsa_cp_local_tokens(tensor: torch.Tensor, local_cache_plan):
+    from vllm_ascend.attention.context_parallel.dsa_cp import gather_dsa_cp_local_tokens
+
+    return gather_dsa_cp_local_tokens(tensor, local_cache_plan)
+
+
+def _compact_dsa_cp_sample_tokens(tensor: torch.Tensor, global_indices: torch.Tensor, local_cache_plan):
+    from vllm_ascend.attention.context_parallel.dsa_cp import compact_dsa_cp_sample_tokens
+
+    return compact_dsa_cp_sample_tokens(tensor, global_indices, local_cache_plan)
 
 
 # TODO: Remove it when the bug of fx-graph is solved
@@ -190,6 +230,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         draft_model_config = getattr(spec_config, "draft_model_config", None)
         draft_hf_config = draft_model_config.hf_config if draft_model_config is not None else None
         self._share_mtp_indices = getattr(draft_hf_config, "index_share_for_mtp_iteration", False)
+        self._mtp_hidden_states_are_local = False
+        self._mtp_local_num_tokens = 0
+        self._in_dummy_run = False
 
         # NOTE:
         # `draft_tensor_parallel_size` does not take effect for Eagle:
@@ -539,6 +582,38 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # when update. So we can use the shallow copy.
         return copy.copy(attn_metadata)
 
+    def _get_dummy_sample_count(
+        self,
+        batch_size: int,
+        num_reqs: int,
+        use_dsa_cp_local_layout: bool,
+    ) -> tuple[int, bool]:
+        """Return the number of draft LM-head rows for a dummy run.
+
+        The legacy dummy path infers a decode batch from the flattened token
+        count. That overestimates the number of sampling rows for a prefill
+        run (for example, 32768 tokens and one speculative token become 16384
+        rows). A new-CP prefill still runs the transformer over every local
+        token, but only needs one LM-head sampling row per request.
+
+        Keep the legacy behavior unless a PD-disaggregated P node has an
+        active new-CP local-cache plan. The plan state is passed by the target
+        model runner because non-full-graph drafter dummy contexts do not own
+        attention metadata from which the plan can be rediscovered.
+        """
+        is_pd_prefill_producer = (
+            self.runner.is_kv_producer and not self.runner.is_kv_consumer
+        )
+        use_new_cp_prefill_compact = (
+            self.method == "mtp"
+            and is_pd_prefill_producer
+            and ascend_envs.VLLM_ASCEND_ENABLE_DSA_CP_COMPACT_OUTPUT
+            and use_dsa_cp_local_layout
+        )
+        if use_new_cp_prefill_compact:
+            return max(num_reqs, 1), True
+        return batch_size * self.extra_slots_per_request, False
+
     def _freeze_draft_index_attn_metadata(self, attn_metadata):
         decode_metadata = getattr(attn_metadata, "decode", None)
         if decode_metadata is not None:
@@ -558,7 +633,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         batch_descriptor=None,
         dummy_compute_logits=lambda hidden_states: None,
         is_profile=False,
+        use_dsa_cp_local_layout: bool = False,
     ):
+        # Dummy runs do not consume target hidden states. Clear the per-request
+        # compact-output state left by a previous real target forward; no
+        # local-cache plan is installed in the drafter dummy context.
+        self._mtp_hidden_states_are_local = False
+        self._mtp_local_num_tokens = 0
+
         (
             num_tokens,
             num_tokens_across_dp,
@@ -706,16 +788,31 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
-            self._runnable(
+            sample_count, use_new_cp_prefill_compact = (
+                self._get_dummy_sample_count(
+                    batch_size,
+                    num_reqs,
+                    use_dsa_cp_local_layout,
+                )
+            )
+            model_inputs = dict(
                 num_input_tokens=num_tokens,
                 batch_size=batch_size,
-                token_indices_to_sample=self.token_indices_to_sample[: batch_size * self.extra_slots_per_request],
+                token_indices_to_sample=self.token_indices_to_sample[:sample_count],
                 # The target_position's address is same as the model_positions's
                 target_positions=model_positions,
                 inputs_embeds=inputs_embeds,
                 multi_steps_attn_metadata=multi_steps_attn_metadata,
                 num_tokens=num_tokens,
             )
+            if use_new_cp_prefill_compact:
+                model_inputs["is_prefill"] = True
+            was_in_dummy_run = self._in_dummy_run
+            self._in_dummy_run = True
+            try:
+                self._runnable(**model_inputs)
+            finally:
+                self._in_dummy_run = was_in_dummy_run
             forward_context = get_forward_context()
             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
                 self._update_full_graph_params(forward_context, num_tokens, multi_steps_attn_metadata)
@@ -1107,6 +1204,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         model_input_ids = self.input_ids[:num_input_tokens]
         model_positions = self._get_positions(num_input_tokens)
 
+        hidden_num_tokens = self._mtp_local_num_tokens if self._mtp_hidden_states_are_local else num_input_tokens
+        model_hidden_states = self.hidden_states[:hidden_num_tokens] if self.pass_hidden_states_to_model else None
+        if self.method == "mtp":
+            model_input_ids, model_positions, model_hidden_states, inputs_embeds = self.prepare_mtp_model_inputs(
+                model_input_ids,
+                model_positions,
+                model_hidden_states,
+                inputs_embeds,
+            )
+
         if self.method == "dflash":
             model_kwargs = self.build_model_inputs_first_pass(num_input_tokens)
         else:
@@ -1117,8 +1224,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             }
 
             if self.pass_hidden_states_to_model:
-                model_hidden_states = self.hidden_states[:num_input_tokens]
-                model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
+                assert model_hidden_states is not None
+                if self.method != "mtp":
+                    model_hidden_states, model_positions = self.maybe_pad_and_reduce(
+                        model_hidden_states, model_positions
+                    )
                 model_kwargs["hidden_states"] = model_hidden_states
                 if self.method == "mtp":
                     model_kwargs["positions"] = model_positions
@@ -1189,10 +1299,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 token_indices_to_sample, (0, max_num_reqs_across_dp - num_indices)
             )
 
-        sample_hidden_states = last_hidden_states[token_indices_to_sample]
+        sample_hidden_states = self._select_mtp_sample_hidden_states(
+            last_hidden_states, token_indices_to_sample
+        )
 
         if get_ascend_config().enable_reduce_sample:
-            if self.method in ("eagle3", "dflash", "mtp"):
+            if self.method == "mtp":
+                logits = self.model.compute_logits(sample_hidden_states)
+                draft_token_ids = greedy_sample(logits)
+                if lmhead_tp_enable():
+                    draft_token_ids, token_indices_to_sample = self._align_tensor_and_indices(
+                        draft_token_ids,
+                        num_indices,
+                        token_indices_to_sample,
+                        ori_token_indices_to_sample,
+                        is_logits=False,
+                    )
+            elif self.method in ("eagle3", "dflash"):
                 draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
                 if lmhead_tp_enable():
                     draft_token_ids, token_indices_to_sample = self._align_tensor_and_indices(
@@ -1234,7 +1357,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # [batch_size, 1]
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
-        if self.pcp_size * self.dcp_size > 1 and is_prefill:
+        local_cache_prefill = (
+            ascend_envs.VLLM_ASCEND_ENABLE_DSA_CP_COMPACT_OUTPUT
+            and _get_dsa_cp_local_cache_plan() is not None
+        )
+        if (self.pcp_size * self.dcp_size > 1 or local_cache_prefill) and is_prefill:
             draft_token_ids_list = []
             for _ in range(self.num_speculative_tokens):
                 draft_token_ids_list.append(draft_token_ids)
@@ -1257,7 +1384,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             positions = self.mrope_positions[:, token_indices_to_sample]
         else:
             positions = self.positions[token_indices_to_sample]
-        hidden_states = hidden_states[token_indices_to_sample]
+        hidden_states = self._select_mtp_sample_hidden_states(
+            hidden_states, token_indices_to_sample
+        )
         token_indices_to_sample = self.arange[:batch_size]
 
         input_batch_size = num_input_tokens if (self.method == "mtp" or self.use_cuda_graph) else batch_size
@@ -1317,11 +1446,21 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             model_positions = self._get_positions(input_batch_size)
             model_hidden_states = self.hidden_states[:input_batch_size]
 
-            model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
-
             forward_context.attn_metadata = (
                 multi_steps_attn_metadata[draft_index + 1] if multi_steps_attn_metadata else None
             )
+
+            if self.method == "mtp":
+                model_input_ids, model_positions, model_hidden_states, inputs_embeds = self.prepare_mtp_model_inputs(
+                    model_input_ids,
+                    model_positions,
+                    model_hidden_states,
+                    inputs_embeds,
+                )
+            else:
+                model_hidden_states, model_positions = self.maybe_pad_and_reduce(
+                    model_hidden_states, model_positions
+                )
 
             model_kwargs = {
                 "input_ids": model_input_ids,
@@ -1352,9 +1491,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     (0, max_num_reqs_across_dp - num_indices),
                 )
 
-            sample_hidden_states = last_hidden_states[token_indices_to_sample]
+            sample_hidden_states = self._select_mtp_sample_hidden_states(
+                last_hidden_states, token_indices_to_sample
+            )
             if get_ascend_config().enable_reduce_sample:
-                if self.method in ("eagle3", "dflash", "mtp"):
+                if self.method == "mtp":
+                    logits = self.model.compute_logits(sample_hidden_states)
+                    draft_token_ids = greedy_sample(logits)
+                    if lmhead_tp_enable() and num_indices < draft_token_ids.shape[0]:
+                        draft_token_ids = draft_token_ids[:num_indices]
+                        token_indices_to_sample = token_indices_to_sample[:num_indices]
+                elif self.method in ("eagle3", "dflash"):
                     draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
                     if lmhead_tp_enable() and num_indices < draft_token_ids.shape[0]:
                         draft_token_ids = draft_token_ids[:num_indices]
@@ -1494,7 +1641,29 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 target_positions = target_positions[0]
 
             self._set_positions(num_tokens, target_positions)
-            self.hidden_states[:num_tokens] = target_hidden_states.view(num_tokens, -1)
+            # This runs before the draft forward context is installed, so the
+            # draft local-cache plan is not available yet. New CP is the only
+            # target path allowed to return fewer rows than the global target
+            # token count: legacy FlashComm1/SP has already all-gathered its
+            # target output. Keep the local row count here; once the draft
+            # context is active, prepare_mtp_model_inputs() validates and uses
+            # the actual local-cache plan.
+            use_local_hidden_states = (
+                self.method == "mtp"
+                and ascend_envs.VLLM_ASCEND_ENABLE_DSA_CP_COMPACT_OUTPUT
+                and target_hidden_states.shape[0] < num_tokens
+            )
+            if use_local_hidden_states:
+                local_num_tokens = target_hidden_states.shape[0]
+                self.hidden_states[:local_num_tokens].copy_(
+                    target_hidden_states.view(local_num_tokens, -1)
+                )
+                self._mtp_hidden_states_are_local = True
+                self._mtp_local_num_tokens = local_num_tokens
+            else:
+                self.hidden_states[:num_tokens] = target_hidden_states.view(num_tokens, -1)
+                self._mtp_hidden_states_are_local = False
+                self._mtp_local_num_tokens = 0
 
             return num_tokens, token_indices_to_sample, cad, (query_lens_d, ori_token_indices_to_sample)
         else:
@@ -2230,6 +2399,38 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 hidden_states = split_inputs_tp_to_sp(hidden_states, hidden_states)
         return hidden_states, positions
 
+    def prepare_mtp_model_inputs(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Prepare MTP inputs for the legacy-SP or new-CP model path.
+
+        Vocab-parallel embedding requires every TP rank to reduce the same
+        token rows. Keep ``input_ids`` and ``inputs_embeds`` in global request
+        order; the DeepSeek V4 model selects the local-cache CP rows once, after
+        embedding. Positions and target hidden states enter the transformer
+        directly, so they must already use the rank-local layout.
+        """
+        local_cache_plan = _get_dsa_cp_local_cache_plan()
+        if self._mtp_hidden_states_are_local and local_cache_plan is None:
+            raise RuntimeError(
+                "DSA CP compact target output requires a local-cache plan "
+                "for the MTP draft forward."
+            )
+        if local_cache_plan is not None:
+            return (
+                input_ids,
+                _select_dsa_cp_local_tokens(positions, local_cache_plan),
+                _ensure_dsa_cp_local_tokens(hidden_states, local_cache_plan),
+                inputs_embeds,
+            )
+        if hidden_states is not None:
+            hidden_states, positions = self.maybe_pad_and_reduce(hidden_states, positions)
+        return input_ids, positions, hidden_states, inputs_embeds
+
     def maybe_all_gather_and_unpad(
         self,
         last_hidden_states: torch.Tensor,
@@ -2237,7 +2438,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if self.method == "mtp":
-            if self.enable_shared_expert_dp:
+            local_cache_plan = _get_dsa_cp_local_cache_plan()
+            if local_cache_plan is not None:
+                if (
+                    ascend_envs.VLLM_ASCEND_ENABLE_DSA_CP_COMPACT_OUTPUT
+                    and last_hidden_states.shape[0]
+                    == local_cache_plan.local_num_tokens
+                ):
+                    return last_hidden_states, positions, hidden_states
+                gathered_last_hidden_states = _gather_dsa_cp_local_tokens(
+                    last_hidden_states, local_cache_plan
+                )
+                num_actual_tokens = sum(local_cache_plan.all_rank_num_tokens)
+                positions = self._get_positions(num_actual_tokens)
+                if hidden_states is last_hidden_states:
+                    hidden_states = gathered_last_hidden_states
+                elif hidden_states is not None:
+                    hidden_states = _gather_dsa_cp_local_tokens(hidden_states, local_cache_plan)
+                last_hidden_states = gathered_last_hidden_states
+            elif self.enable_shared_expert_dp:
                 last_hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                     last_hidden_states.contiguous(), True
                 )
@@ -2254,6 +2473,22 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if hidden_states is not None:
                     hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states.contiguous(), True)
         return last_hidden_states, positions, hidden_states
+
+    def _select_mtp_sample_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        global_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.method == "mtp" and ascend_envs.VLLM_ASCEND_ENABLE_DSA_CP_COMPACT_OUTPUT:
+            local_cache_plan = _get_dsa_cp_local_cache_plan()
+            if (
+                local_cache_plan is not None
+                and hidden_states.shape[0] == local_cache_plan.local_num_tokens
+            ):
+                return _compact_dsa_cp_sample_tokens(
+                    hidden_states, global_indices, local_cache_plan
+                )
+        return hidden_states[global_indices]
 
     # In the context of the dummy‑run accompaniment of p‑eagle, when num_indices becomes large,
     # enabling the LM head feature causes token_indices_to_sample to switch from padding to trimming.
