@@ -78,6 +78,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # For a detailed introduction to the parameters and the differences and applicable scenarios
     # between this feature and FLASHCOMM1, please refer to the feature guide in the documentation.
     "VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE": lambda: int(os.getenv("VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE", 0)),
+    # Whether to enable DeepSeek DSA CP local-cache prefill path.
+    # 0: disabled, keep the existing full-hidden-state cache calculation path.
+    # 1: enabled, use the new local-cache CP path for supported DeepSeek DSA prefill cases.
+    # This variable is not sensitive.
+    "VLLM_ASCEND_ENABLE_DSA_CP_LOCAL_CACHE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_DSA_CP_LOCAL_CACHE", "0"))
+    ),
     # Whether to enable msMonitor tool to monitor the performance of vllm-ascend.
     "MSMONITOR_USE_DAEMON": lambda: bool(int(os.getenv("MSMONITOR_USE_DAEMON", "0"))),
     # Whether to enable MLAPO optimization for DeepSeek W8A8 series models.

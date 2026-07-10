@@ -228,6 +228,9 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # Current attention state (e.g., ChunkedPrefill, DecodeOnly).
     attn_state: Any = None
 
+    # Stable request ids in the same order as per-request metadata tensors.
+    request_ids: list[str] | None = None
+
     # Padding size for graph capture, -1 means not in graph mode.
     graph_pad_size: int = -1
 
@@ -266,6 +269,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             positions=self.positions,
             positions_cpu=self.positions_cpu,
             attn_state=self.attn_state,
+            request_ids=self.request_ids[:num_actual_reqs] if self.request_ids is not None else None,
             graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,

@@ -11,6 +11,7 @@ from vllm.distributed import get_tp_group
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, split_decodes_and_prefills
@@ -18,7 +19,11 @@ from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
-from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
+from vllm_ascend.ops.rope_dsv4 import (
+    concatenate_rope_slices,
+    get_cos_and_sin_dsa,
+    get_full_cos_and_sin_dsa,
+)
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -27,6 +32,8 @@ from vllm_ascend.utils import (
     olora_tp_enable,
 )
 
+
+DSACP_LOCAL_CACHE_UNIT_SIZE = 128
 
 def hadamard_transform_ref(
     x: torch.Tensor,
@@ -58,6 +65,746 @@ def _has_prefill(attn_state: AscendAttentionState) -> bool:
 
 
 @dataclass
+class DSACPLocalCachePlan:
+    """Local-cache CP plan for the opt-in DeepSeek DSA prefill path."""
+
+    enabled: bool
+    cp_size: int
+    cp_rank: int
+    query_start_loc: tuple[int, ...]
+    rank_request_ranges: tuple[tuple[tuple[int, int], ...], ...] # ranks(requests(start,end)) without padding
+    rank_valid_ranges: tuple[tuple[tuple[int, int], ...], ...]
+    local_request_ranges: tuple[tuple[int, int], ...]
+    local_valid_ranges: tuple[tuple[int, int], ...]
+    local_offsets: tuple[int, ...]
+    all_rank_num_tokens: tuple[int, ...]
+    local_start: int
+    local_end: int
+    tokens_per_rank: int
+    num_tokens_pad: int
+    unit_size: int
+    local_num_tokens: int
+
+
+@dataclass
+class DSACPSWAWindowPlan:
+    """Per-request SWA owner ranges and 128-token halo ranges."""
+
+    input_ranges: list[tuple[int, int]]
+    valid_ranges: list[tuple[int, int]]
+    halo_ranges: list[tuple[int, int]]
+    all_rank_valid_token_counts: tuple[int, ...]
+    all_rank_slot_mappings: tuple[torch.Tensor, ...]
+
+
+@dataclass
+class DSACPCompressorSlotPlan:
+    """Local compressor input ranges and owner-only cache slot mapping."""
+
+    input_ranges: list[tuple[int, int]]
+    valid_ranges: list[tuple[int, int]]
+    overlap_ranges: list[tuple[int, int]]
+    slot_mapping: torch.Tensor
+    valid_output_mask: torch.Tensor
+    output_indices: torch.Tensor
+    compressed_positions: torch.Tensor
+    input_indices: torch.Tensor
+    input_query_start_loc: torch.Tensor
+    request_indices: torch.Tensor
+    request_indices_cpu: torch.Tensor
+    request_ids: list[str] | None
+    start_pos_offsets: torch.Tensor
+    prefix_lengths: torch.Tensor
+    current_start_positions: torch.Tensor
+    has_prefix_hidden: bool
+    all_rank_valid_output_counts: tuple[int, ...]
+    all_rank_slot_mappings: tuple[torch.Tensor, ...]
+
+
+@dataclass
+class DSACPStateBroadcastPlan:
+    """Per-request final-state owner and state-block selection plan."""
+
+    source_ranks: torch.Tensor
+    local_request_indices: torch.Tensor
+    tail_token_offsets: torch.Tensor
+    state_block_ids: torch.Tensor
+    state_block_indices: torch.Tensor
+    state_valid_mask: torch.Tensor
+
+
+@dataclass
+class DSACPHiddenInputPlan:
+    """Source ranges for assembling local-cache CP hidden inputs."""
+
+    input_ranges: list[tuple[int, int]]
+    local_source_ranges: list[tuple[int, int]]
+    local_read_ranges: list[tuple[int, int]]
+    local_output_ranges: list[tuple[int, int]]
+    halo_source_ranges: list[tuple[int, int]]
+    halo_output_ranges: list[tuple[int, int]]
+    num_input_tokens: int
+
+
+def _get_dsa_cp_local_range(
+    num_input_tokens: int,
+    cp_size: int,
+    cp_rank: int,
+    unit_size: int,
+) -> tuple[int, int]:
+    num_units = math.ceil(num_input_tokens / unit_size)
+    base_units = num_units // cp_size
+    remainder_units = num_units % cp_size
+    local_units = base_units + int(cp_rank < remainder_units)
+    local_start_units = cp_rank * base_units + min(cp_rank, remainder_units)
+    local_start = local_start_units * unit_size
+    return local_start, local_start + local_units * unit_size
+
+
+def _ceil_to_unit(num_tokens: int, unit_size: int) -> int:
+    if num_tokens <= 0:
+        return 0
+    return math.ceil(num_tokens / unit_size) * unit_size
+
+
+def _logical_padded_offset_to_real(
+    logical_offset: int,
+    request_padded_start: int,
+    request_start: int,
+    request_len: int,
+) -> int:
+    request_offset = max(0, logical_offset - request_padded_start)
+    return request_start + min(request_offset, request_len)
+
+
+
+def _filter_non_empty_ranges(
+    ranges: tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int], ...]:
+    return tuple((start, end) for start, end in ranges if start < end)
+
+
+def _build_local_offsets(ranges: tuple[tuple[int, int], ...]) -> tuple[int, ...]:
+    offsets: list[int] = []
+    cursor = 0
+    for start, end in ranges:
+        offsets.append(cursor)
+        cursor += end - start
+    return tuple(offsets)
+
+
+def _sum_ranges(ranges: tuple[tuple[int, int], ...]) -> int:
+    return sum(max(0, end - start) for start, end in ranges)
+
+
+def _select_indexer_hidden_states_full(
+    hidden_states_full: torch.Tensor | None,
+    hidden_states_cache: torch.Tensor,
+    use_local_cache_prefill: bool,
+) -> torch.Tensor | None:
+    """Keep legacy and local-cache CP indexer inputs isolated."""
+    if use_local_cache_prefill:
+        return hidden_states_full
+    return hidden_states_cache
+
+
+def _find_local_range_offset(
+    local_cache_plan: DSACPLocalCachePlan,
+    token_offset: int,
+) -> tuple[int, int, int] | None:
+    for (range_start, range_end), local_offset in zip(
+        local_cache_plan.local_valid_ranges, local_cache_plan.local_offsets
+    ):
+        if range_start <= token_offset < range_end:
+            return range_start, range_end, local_offset
+    return None
+
+
+def _next_local_range_start(
+    local_cache_plan: DSACPLocalCachePlan,
+    token_offset: int,
+    range_end: int,
+) -> int:
+    next_start = range_end
+    for local_start, local_end in local_cache_plan.local_valid_ranges:
+        if token_offset < local_start:
+            next_start = min(next_start, local_start)
+        elif local_start <= token_offset < local_end:
+            next_start = token_offset
+            break
+    return next_start
+
+
+def get_dsa_cp_all_rank_token_counts(
+    local_cache_plan: DSACPLocalCachePlan,
+    num_actual_tokens: int | None = None,
+) -> tuple[int, ...]:
+    if num_actual_tokens is None:
+        return local_cache_plan.all_rank_num_tokens
+    token_counts = []
+    for rank_ranges in local_cache_plan.rank_valid_ranges:
+        token_counts.append(
+            sum(max(0, min(end, num_actual_tokens) - min(start, num_actual_tokens)) for start, end in rank_ranges)
+        )
+    return tuple(token_counts)
+
+
+def build_dsa_cp_hidden_input_plan(
+    input_ranges: list[tuple[int, int]],
+    local_cache_plan: DSACPLocalCachePlan,
+    num_actual_tokens: int,
+) -> DSACPHiddenInputPlan:
+    """Plan hidden-state assembly from current local hidden and halo cache.
+
+    Ranges use flattened-batch token offsets. ``local_source_ranges`` are read
+    from this rank's compact local hidden tensor. ``halo_source_ranges`` must be
+    provided by cross-rank gather or the per-layer hidden-state halo cache.
+    Output ranges address the concatenated input tensor assembled from
+    ``input_ranges`` in order.
+    """
+
+    clipped_input_ranges: list[tuple[int, int]] = []
+    local_source_ranges: list[tuple[int, int]] = []
+    local_read_ranges: list[tuple[int, int]] = []
+    local_output_ranges: list[tuple[int, int]] = []
+    halo_source_ranges: list[tuple[int, int]] = []
+    halo_output_ranges: list[tuple[int, int]] = []
+    output_offset = 0
+
+    for range_start, range_end in input_ranges:
+        range_start = max(0, min(range_start, num_actual_tokens))
+        range_end = max(0, min(range_end, num_actual_tokens))
+        if range_start >= range_end:
+            continue
+
+        clipped_input_ranges.append((range_start, range_end))
+        cursor = range_start
+        while cursor < range_end:
+            local_segment = _find_local_range_offset(local_cache_plan, cursor)
+            if local_segment is None:
+                segment_end = _next_local_range_start(local_cache_plan, cursor, range_end)
+                if segment_end <= cursor:
+                    segment_end = range_end
+                halo_source_ranges.append((cursor, segment_end))
+                halo_output_ranges.append((output_offset, output_offset + segment_end - cursor))
+            else:
+                local_start, local_end, local_offset = local_segment
+                segment_end = min(range_end, local_end)
+                read_start = local_offset + cursor - local_start
+                read_end = read_start + segment_end - cursor
+                local_source_ranges.append((cursor, segment_end))
+                local_read_ranges.append((read_start, read_end))
+                local_output_ranges.append((output_offset, output_offset + segment_end - cursor))
+            output_offset += segment_end - cursor
+            cursor = segment_end
+
+    return DSACPHiddenInputPlan(
+        input_ranges=clipped_input_ranges,
+        local_source_ranges=local_source_ranges,
+        local_read_ranges=local_read_ranges,
+        local_output_ranges=local_output_ranges,
+        halo_source_ranges=halo_source_ranges,
+        halo_output_ranges=halo_output_ranges,
+        num_input_tokens=output_offset,
+    )
+
+
+def build_dsa_cp_state_broadcast_plan(
+    local_cache_plan: DSACPLocalCachePlan,
+    query_start_loc: list[int],
+    num_actual_tokens: int,
+    input_positions: torch.Tensor | None = None,
+    state_block_table: torch.Tensor | None = None,
+    compress_ratio: int = 1,
+    state_block_size: int = 1,
+) -> DSACPStateBroadcastPlan:
+    """Build final-state broadcast ownership for current flattened chunk.
+
+    When state block inputs are provided, the plan also identifies the state
+    cache block that stores each request's final compressor/indexer state.
+    """
+
+    if compress_ratio <= 0:
+        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
+    if state_block_size <= 0:
+        raise ValueError(f"state_block_size must be positive, got {state_block_size}")
+
+    source_ranks: list[int] = []
+    local_request_indices: list[int] = []
+    tail_token_offsets: list[int] = []
+    state_block_indices: list[int] = []
+    state_valid_mask: list[bool] = []
+
+    has_state_blocks = input_positions is not None and state_block_table is not None
+    max_state_blocks = state_block_table.shape[1] if state_block_table is not None else 0
+
+    for req_idx, (req_start, req_end) in enumerate(zip(query_start_loc[:-1], query_start_loc[1:])):
+        req_start = min(req_start, num_actual_tokens)
+        req_end = min(req_end, num_actual_tokens)
+        if req_start >= req_end:
+            source_ranks.append(-1)
+            tail_token_offsets.append(-1)
+            state_block_indices.append(-1)
+            state_valid_mask.append(False)
+            continue
+
+        tail_token_offset = req_end - 1
+        tail_owner_rank = -1
+        for rank, rank_ranges in enumerate(local_cache_plan.rank_valid_ranges):
+            if req_idx >= len(rank_ranges):
+                continue
+            rank_start, rank_end = rank_ranges[req_idx]
+            if rank_start <= tail_token_offset < rank_end:
+                tail_owner_rank = rank
+                break
+
+        source_ranks.append(tail_owner_rank)
+        tail_token_offsets.append(tail_token_offset)
+        if tail_owner_rank == local_cache_plan.cp_rank:
+            local_request_indices.append(req_idx)
+
+        state_block_index = -1
+        state_valid = False
+        if has_state_blocks:
+            tail_position = int(input_positions[tail_token_offset].item())
+            state_index = tail_position // compress_ratio
+            state_block_index = state_index // state_block_size
+            state_valid = tail_owner_rank >= 0 and state_block_index < max_state_blocks
+        state_block_indices.append(state_block_index if state_valid else -1)
+        state_valid_mask.append(state_valid)
+
+    source_rank_tensor = torch.tensor(source_ranks, dtype=torch.int32)
+    local_request_tensor = torch.tensor(local_request_indices, dtype=torch.long)
+    tail_offset_tensor = torch.tensor(tail_token_offsets, dtype=torch.long)
+    state_block_index_tensor = torch.tensor(state_block_indices, dtype=torch.long)
+    state_valid_tensor = torch.tensor(state_valid_mask, dtype=torch.bool)
+
+    if state_block_table is None:
+        state_block_ids = torch.full_like(state_block_index_tensor, -1, dtype=torch.int32)
+    else:
+        state_block_index_device = state_block_index_tensor.to(device=state_block_table.device)
+        state_valid_device = state_valid_tensor.to(device=state_block_table.device)
+        request_indices = torch.arange(len(state_block_indices), dtype=torch.long, device=state_block_table.device)
+        safe_block_indices = torch.clamp(state_block_index_device, min=0, max=max(max_state_blocks - 1, 0))
+        state_block_ids = state_block_table[request_indices, safe_block_indices].to(torch.int32)
+        state_block_ids = torch.where(
+            state_valid_device,
+            state_block_ids,
+            torch.full_like(state_block_ids, -1),
+        )
+        state_block_ids = state_block_ids.cpu()
+
+    return DSACPStateBroadcastPlan(
+        source_ranks=source_rank_tensor,
+        local_request_indices=local_request_tensor,
+        tail_token_offsets=tail_offset_tensor,
+        state_block_ids=state_block_ids,
+        state_block_indices=state_block_index_tensor,
+        state_valid_mask=state_valid_tensor,
+    )
+
+
+def build_dsa_cp_local_compressed_range(
+    input_positions: torch.Tensor,
+    compress_ratio: int,
+    local_cache_plan: DSACPLocalCachePlan,
+    num_actual_tokens: int,
+) -> tuple[int, int]:
+    if compress_ratio <= 1:
+        return 0, 0
+
+    actual_positions = input_positions[:num_actual_tokens]
+    compressed_mask = ((actual_positions + 1) % compress_ratio) == 0
+    token_offsets = torch.arange(num_actual_tokens, device=actual_positions.device)
+    local_mask = torch.zeros_like(compressed_mask, dtype=torch.bool)
+    for valid_start, valid_end in local_cache_plan.local_valid_ranges:
+        valid_start = min(valid_start, num_actual_tokens)
+        valid_end = min(valid_end, num_actual_tokens)
+        if valid_start < valid_end:
+            local_mask |= (token_offsets >= valid_start) & (token_offsets < valid_end)
+
+    local_compressed = compressed_mask & local_mask
+    if not local_compressed.any():
+        compressed_count = int(compressed_mask.sum().item())
+        if not local_cache_plan.local_valid_ranges:
+            return compressed_count, compressed_count
+        first_local_start = min(start for start, _ in local_cache_plan.local_valid_ranges)
+        before_local = compressed_mask & (token_offsets < first_local_start)
+        compressed_start = int(before_local.sum().item())
+        return compressed_start, compressed_start
+
+    compressed_indices = torch.cumsum(compressed_mask.to(torch.long), dim=0) - 1
+    selected_indices = compressed_indices[local_compressed]
+    return int(selected_indices[0].item()), int(selected_indices[-1].item()) + 1
+
+
+def build_dsa_cp_local_compressor_slot_plan(
+    input_positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    compress_ratio: int,
+    local_cache_plan: DSACPLocalCachePlan,
+    query_start_loc: list[int],
+    num_actual_tokens: int,
+    overlap_tokens: int,
+    request_ids: list[str] | None = None,
+) -> DSACPCompressorSlotPlan:
+    slot_shape = tuple(slot_mapping.shape[1:])
+    if compress_ratio <= 1:
+        empty_slot_mapping = slot_mapping.new_empty((0, *slot_shape))
+        empty_bool = torch.empty((0,), dtype=torch.bool, device=slot_mapping.device)
+        empty_indices = torch.empty((0,), dtype=torch.long, device=slot_mapping.device)
+        empty_start_loc = torch.zeros((1,), dtype=torch.int32, device=slot_mapping.device)
+        empty_i32 = torch.empty((0,), dtype=torch.int32, device=slot_mapping.device)
+        return DSACPCompressorSlotPlan(
+            input_ranges=[],
+            valid_ranges=[],
+            overlap_ranges=[],
+            slot_mapping=empty_slot_mapping,
+            valid_output_mask=empty_bool,
+            output_indices=empty_indices,
+            compressed_positions=empty_indices,
+            input_indices=empty_indices,
+            input_query_start_loc=empty_start_loc,
+            request_indices=empty_indices,
+            request_indices_cpu=torch.empty((0,), dtype=torch.long),
+            request_ids=None,
+            start_pos_offsets=empty_i32,
+            prefix_lengths=empty_i32,
+            current_start_positions=empty_i32,
+            has_prefix_hidden=False,
+            all_rank_valid_output_counts=(),
+            all_rank_slot_mappings=(),
+        )
+    if overlap_tokens < 0:
+        raise ValueError(f"overlap_tokens must be non-negative, got {overlap_tokens}")
+
+    actual_positions = input_positions[:num_actual_tokens]
+    compressed_mask = ((actual_positions + 1) % compress_ratio) == 0
+    compressed_indices = torch.cumsum(compressed_mask.to(torch.long), dim=0) - 1
+    invalid_slot = slot_mapping.new_full((1, *slot_shape), -1)
+    output_slots: list[torch.Tensor] = []
+    output_valid_masks: list[torch.Tensor] = []
+    output_indices: list[torch.Tensor] = []
+    compressed_positions: list[torch.Tensor] = []
+    input_indices: list[torch.Tensor] = []
+    input_lengths: list[int] = []
+    request_indices: list[int] = []
+    start_pos_offsets: list[int] = []
+    prefix_lengths: list[int] = []
+    current_start_positions: list[int] = []
+    input_ranges: list[tuple[int, int]] = []
+    valid_ranges: list[tuple[int, int]] = []
+    overlap_ranges: list[tuple[int, int]] = []
+
+    token_offsets = torch.arange(num_actual_tokens, device=actual_positions.device)
+    all_rank_valid_output_counts = []
+    all_rank_slot_mappings = []
+    for rank_ranges in local_cache_plan.rank_valid_ranges:
+        rank_mask = torch.zeros_like(compressed_mask, dtype=torch.bool)
+        for rank_start, rank_end in rank_ranges:
+            rank_start = min(rank_start, num_actual_tokens)
+            rank_end = min(rank_end, num_actual_tokens)
+            if rank_start < rank_end:
+                rank_mask |= (token_offsets >= rank_start) & (token_offsets < rank_end)
+        rank_mask &= compressed_mask
+        rank_count = int(rank_mask.sum().item())
+        all_rank_valid_output_counts.append(rank_count)
+        if rank_count > 0:
+            rank_full_indices = compressed_indices[rank_mask].to(device=slot_mapping.device, dtype=torch.long)
+            all_rank_slot_mappings.append(slot_mapping[rank_full_indices])
+        else:
+            all_rank_slot_mappings.append(slot_mapping.new_empty((0, *slot_shape)))
+
+    for req_idx, (req_start, req_end) in enumerate(zip(query_start_loc[:-1], query_start_loc[1:])):
+        req_start = min(req_start, num_actual_tokens)
+        req_end = min(req_end, num_actual_tokens)
+        if req_idx >= len(local_cache_plan.rank_valid_ranges[local_cache_plan.cp_rank]):
+            continue
+        valid_start, valid_end = local_cache_plan.rank_valid_ranges[local_cache_plan.cp_rank][req_idx]
+        valid_start = max(req_start, min(valid_start, num_actual_tokens))
+        valid_end = min(req_end, min(valid_end, num_actual_tokens))
+        if valid_start >= valid_end:
+            continue
+
+        current_start_pos = int(actual_positions[req_start].item()) if req_start < req_end else 0
+        current_valid_start_pos = int(actual_positions[valid_start].item())
+        current_valid_end_pos = int(actual_positions[valid_end - 1].item()) + 1
+        owner_offsets = torch.nonzero(
+            compressed_mask[valid_start:valid_end], as_tuple=False
+        ).flatten() + valid_start
+        if owner_offsets.numel() > 0:
+            first_owner_pos = int(actual_positions[owner_offsets[0]].item())
+            needed_abs_start = max(0, first_owner_pos + 1 - compress_ratio)
+        else:
+            needed_abs_start = current_valid_start_pos
+        input_start = max(req_start, valid_start - overlap_tokens)
+        input_start_pos = int(actual_positions[input_start].item())
+        input_abs_start = min(input_start_pos, needed_abs_start)
+        prefix_len = max(0, current_start_pos - input_abs_start)
+        if prefix_len > 0:
+            input_start = req_start
+        input_end = valid_end
+        input_ranges.append((input_start, input_end))
+        valid_ranges.append((valid_start, valid_end))
+        overlap_ranges.append((input_start, valid_start))
+        input_indices.append(torch.arange(input_start, input_end, dtype=torch.long, device=slot_mapping.device))
+        input_lengths.append(prefix_len + input_end - input_start)
+        request_indices.append(req_idx)
+        start_pos_offsets.append(input_abs_start - current_start_pos)
+        prefix_lengths.append(prefix_len)
+        current_start_positions.append(current_start_pos)
+
+        output_positions = torch.arange(
+            input_abs_start,
+            current_valid_end_pos,
+            dtype=actual_positions.dtype,
+            device=actual_positions.device,
+        )
+        local_compressed_positions_mask = ((output_positions + 1) % compress_ratio) == 0
+        local_output_positions = output_positions[local_compressed_positions_mask]
+        if local_output_positions.numel() == 0:
+            continue
+
+        owner_mask = (local_output_positions >= current_valid_start_pos) & (
+            local_output_positions < current_valid_end_pos
+        )
+        local_slots = invalid_slot.expand(local_output_positions.numel(), *slot_shape).clone()
+        full_indices = slot_mapping.new_full((local_output_positions.numel(),), -1, dtype=torch.long)
+        output_offsets_in_current = local_output_positions - current_start_pos + req_start
+        output_offsets_in_current = output_offsets_in_current.to(dtype=torch.long, device=compressed_indices.device)
+        in_current_chunk = (output_offsets_in_current >= req_start) & (output_offsets_in_current < req_end)
+        if in_current_chunk.any():
+            in_current_device = in_current_chunk.to(device=slot_mapping.device)
+            known_full_indices = compressed_indices[output_offsets_in_current[in_current_chunk]].to(
+                device=slot_mapping.device
+            )
+            full_indices[in_current_device] = known_full_indices
+        if owner_mask.any():
+            owner_mask_device = owner_mask.to(device=slot_mapping.device)
+            owner_full_indices = full_indices[owner_mask_device]
+            local_slots[owner_mask_device] = slot_mapping[owner_full_indices]
+        owner_mask_device = owner_mask.to(device=slot_mapping.device)
+        output_slots.append(local_slots)
+        output_valid_masks.append(owner_mask_device)
+        output_indices.append(full_indices)
+        compressed_positions.append((local_output_positions + 1 - compress_ratio).to(device=slot_mapping.device))
+
+    if output_slots:
+        local_slot_mapping = torch.cat(output_slots)
+        valid_output_mask = torch.cat(output_valid_masks)
+        local_output_indices = torch.cat(output_indices)
+        local_compressed_positions = torch.cat(compressed_positions)
+    else:
+        local_slot_mapping = slot_mapping.new_empty((0, *slot_shape))
+        valid_output_mask = torch.empty((0,), dtype=torch.bool, device=slot_mapping.device)
+        local_output_indices = slot_mapping.new_empty((0,), dtype=torch.long)
+        local_compressed_positions = slot_mapping.new_empty((0,), dtype=input_positions.dtype)
+
+    if input_indices:
+        local_input_indices = torch.cat(input_indices)
+        local_input_lengths = torch.tensor(input_lengths, dtype=torch.int32, device=slot_mapping.device)
+        local_input_query_start_loc = torch.cat(
+            [
+                torch.zeros((1,), dtype=torch.int32, device=slot_mapping.device),
+                torch.cumsum(local_input_lengths, dim=0),
+            ]
+        )
+        local_request_indices = torch.tensor(request_indices, dtype=torch.long, device=slot_mapping.device)
+        local_request_indices_cpu = torch.tensor(request_indices, dtype=torch.long)
+        local_start_pos_offsets = torch.tensor(start_pos_offsets, dtype=torch.int32, device=slot_mapping.device)
+        local_prefix_lengths = torch.tensor(prefix_lengths, dtype=torch.int32)
+        local_current_start_positions = torch.tensor(
+            current_start_positions, dtype=torch.int32
+        )
+    else:
+        local_input_indices = slot_mapping.new_empty((0,), dtype=torch.long)
+        local_input_query_start_loc = torch.zeros((1,), dtype=torch.int32, device=slot_mapping.device)
+        local_request_indices = slot_mapping.new_empty((0,), dtype=torch.long)
+        local_request_indices_cpu = torch.empty((0,), dtype=torch.long)
+        local_start_pos_offsets = torch.empty((0,), dtype=torch.int32, device=slot_mapping.device)
+        local_prefix_lengths = torch.empty((0,), dtype=torch.int32)
+        local_current_start_positions = torch.empty((0,), dtype=torch.int32)
+
+    return DSACPCompressorSlotPlan(
+        input_ranges=input_ranges,
+        valid_ranges=valid_ranges,
+        overlap_ranges=overlap_ranges,
+        slot_mapping=local_slot_mapping,
+        valid_output_mask=valid_output_mask,
+        output_indices=local_output_indices,
+        compressed_positions=local_compressed_positions,
+        input_indices=local_input_indices,
+        input_query_start_loc=local_input_query_start_loc,
+        request_indices=local_request_indices,
+        request_indices_cpu=local_request_indices_cpu,
+        request_ids=request_ids,
+        start_pos_offsets=local_start_pos_offsets,
+        prefix_lengths=local_prefix_lengths,
+        current_start_positions=local_current_start_positions,
+        has_prefix_hidden=any(prefix_len > 0 for prefix_len in prefix_lengths),
+        all_rank_valid_output_counts=tuple(all_rank_valid_output_counts),
+        all_rank_slot_mappings=tuple(all_rank_slot_mappings),
+    )
+
+
+def build_dsa_cp_swa_window_plan(
+    local_cache_plan: DSACPLocalCachePlan,
+    query_start_loc: list[int],
+    num_actual_tokens: int,
+    slot_mapping: torch.Tensor | None = None,
+    halo_size: int = DSACP_LOCAL_CACHE_UNIT_SIZE,
+) -> DSACPSWAWindowPlan:
+    if halo_size < 0:
+        raise ValueError(f"halo_size must be non-negative, got {halo_size}")
+
+    input_ranges: list[tuple[int, int]] = []
+    valid_ranges: list[tuple[int, int]] = []
+    halo_ranges: list[tuple[int, int]] = []
+    all_rank_valid_token_counts = get_dsa_cp_all_rank_token_counts(local_cache_plan, num_actual_tokens)
+    if slot_mapping is None:
+        slot_mapping = torch.arange(num_actual_tokens, dtype=torch.long)
+    slot_shape = tuple(slot_mapping.shape[1:])
+    all_rank_slot_mappings = []
+    for rank_ranges in local_cache_plan.rank_valid_ranges:
+        rank_slots = []
+        for rank_start, rank_end in rank_ranges:
+            rank_start = min(rank_start, num_actual_tokens)
+            rank_end = min(rank_end, num_actual_tokens)
+            if rank_start < rank_end:
+                rank_slots.append(slot_mapping[rank_start:rank_end])
+        if rank_slots:
+            all_rank_slot_mappings.append(torch.cat(rank_slots, dim=0))
+        else:
+            all_rank_slot_mappings.append(slot_mapping.new_empty((0, *slot_shape)))
+
+    local_rank_ranges = local_cache_plan.rank_valid_ranges[local_cache_plan.cp_rank]
+    for req_idx, (req_start, req_end) in enumerate(zip(query_start_loc[:-1], query_start_loc[1:])):
+        req_start = min(req_start, num_actual_tokens)
+        req_end = min(req_end, num_actual_tokens)
+        if req_idx >= len(local_rank_ranges):
+            continue
+        valid_start, valid_end = local_rank_ranges[req_idx]
+        valid_start = max(req_start, min(valid_start, num_actual_tokens))
+        valid_end = min(req_end, min(valid_end, num_actual_tokens))
+        if valid_start >= valid_end:
+            continue
+
+        halo_start = max(req_start, valid_start - halo_size)
+        input_ranges.append((halo_start, valid_end))
+        valid_ranges.append((valid_start, valid_end))
+        halo_ranges.append((halo_start, valid_start))
+
+    return DSACPSWAWindowPlan(
+        input_ranges=input_ranges,
+        valid_ranges=valid_ranges,
+        halo_ranges=halo_ranges,
+        all_rank_valid_token_counts=all_rank_valid_token_counts,
+        all_rank_slot_mappings=tuple(all_rank_slot_mappings),
+    )
+
+
+def build_dsa_cp_local_cache_plan(
+    num_input_tokens: int,
+    cp_size: int,
+    cp_rank: int,
+    unit_size: int = DSACP_LOCAL_CACHE_UNIT_SIZE,
+    query_start_loc: list[int] | tuple[int, ...] | None = None,
+) -> DSACPLocalCachePlan:
+    if cp_size <= 0:
+        raise ValueError(f"cp_size must be positive, got {cp_size}")
+    if cp_rank < 0 or cp_rank >= cp_size:
+        raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}")
+    if unit_size <= 0:
+        raise ValueError(f"unit_size must be positive, got {unit_size}")
+
+    if query_start_loc is None:
+        query_start_loc_tuple = (0, num_input_tokens)
+    else:
+        query_start_loc_tuple = tuple(int(v) for v in query_start_loc)
+        if len(query_start_loc_tuple) == 0:
+            query_start_loc_tuple = (0, num_input_tokens)
+        if query_start_loc_tuple[0] != 0:
+            raise ValueError("query_start_loc must start from 0")
+
+    request_spans: list[tuple[int, int, int, int]] = []
+    padded_total = 0
+    for req_start, req_end in zip(query_start_loc_tuple[:-1], query_start_loc_tuple[1:]):
+        req_start = min(req_start, num_input_tokens)
+        req_end = min(req_end, num_input_tokens)
+        req_len = max(0, req_end - req_start)
+        padded_len = _ceil_to_unit(req_len, unit_size)
+        request_spans.append((req_start, req_end, padded_total, padded_total + padded_len))
+        padded_total += padded_len
+
+    rank_request_ranges: list[tuple[tuple[int, int], ...]] = []
+    rank_valid_ranges: list[tuple[tuple[int, int], ...]] = []
+    for rank in range(cp_size):
+        rank_padded_start, rank_padded_end = _get_dsa_cp_local_range(
+            padded_total,
+            cp_size,
+            rank,
+            unit_size,
+        )
+        request_ranges: list[tuple[int, int]] = []
+        valid_ranges: list[tuple[int, int]] = []
+        for req_start, req_end, req_padded_start, req_padded_end in request_spans:
+            req_len = max(0, req_end - req_start)
+            owner_start = max(rank_padded_start, req_padded_start)
+            owner_end = min(rank_padded_end, req_padded_end)
+            if owner_start >= owner_end:
+                empty_pos = req_start if rank_padded_end <= req_padded_start else req_end
+                request_ranges.append((empty_pos, empty_pos))
+                valid_ranges.append((empty_pos, empty_pos))
+                continue
+
+            real_start = _logical_padded_offset_to_real(
+                owner_start,
+                req_padded_start,
+                req_start,
+                req_len,
+            )
+            real_end = _logical_padded_offset_to_real(
+                owner_end,
+                req_padded_start,
+                req_start,
+                req_len,
+            )
+            if real_start >= real_end:
+                real_start = real_end
+            request_ranges.append((real_start, real_end))
+            valid_ranges.append((real_start, real_end))
+        rank_request_ranges.append(tuple(request_ranges))
+        rank_valid_ranges.append(tuple(valid_ranges))
+
+    local_request_ranges = rank_request_ranges[cp_rank]
+    local_valid_ranges = _filter_non_empty_ranges(rank_valid_ranges[cp_rank])
+    local_offsets = _build_local_offsets(local_valid_ranges)
+    all_rank_num_tokens = tuple(_sum_ranges(_filter_non_empty_ranges(ranges)) for ranges in rank_valid_ranges)
+    local_num_tokens = all_rank_num_tokens[cp_rank]
+    local_start = min((start for start, _ in local_valid_ranges), default=0)
+    local_end = max((end for _, end in local_valid_ranges), default=local_start)
+
+    return DSACPLocalCachePlan(
+        enabled=True,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        query_start_loc=query_start_loc_tuple,
+        rank_request_ranges=tuple(rank_request_ranges),
+        rank_valid_ranges=tuple(rank_valid_ranges),
+        local_request_ranges=local_request_ranges,
+        local_valid_ranges=local_valid_ranges,
+        local_offsets=local_offsets,
+        all_rank_num_tokens=all_rank_num_tokens,
+        local_start=local_start,
+        local_end=local_end,
+        tokens_per_rank=local_num_tokens,
+        num_tokens_pad=padded_total,
+        unit_size=unit_size,
+        local_num_tokens=local_num_tokens,
+    )
+
+
+@dataclass
 class DSACPMetadata:
     """Context-parallel metadata for sequence-sharded DSA execution."""
 
@@ -69,6 +816,18 @@ class DSACPMetadata:
     num_tokens_pad: int
     local_sin: torch.Tensor = None
     local_cos: torch.Tensor = None
+    local_cache_plan: DSACPLocalCachePlan | None = None
+    swa_window_plan: DSACPSWAWindowPlan | None = None
+    swa_hidden_input_plan: DSACPHiddenInputPlan | None = None
+    swa_slot_mapping: torch.Tensor | None = None
+    swa_valid_start: int = 0
+    swa_valid_end: int = 0
+    compressor_slot_plan: DSACPCompressorSlotPlan | None = None
+    compressor_hidden_input_plan: DSACPHiddenInputPlan | None = None
+    state_broadcast_plan: DSACPStateBroadcastPlan | None = None
+    compressed_slot_mapping: torch.Tensor | None = None
+    compressed_valid_start: int = 0
+    compressed_valid_end: int = 0
 
 
 @dataclass
@@ -80,14 +839,17 @@ class AscendDSAReqMetadata:
     without distinguishing prefill vs decode request types.
     """
 
-    input_positions: torch.Tensor
     block_table: torch.Tensor
     seq_lens: torch.Tensor
     slot_mapping: torch.Tensor | None
     block_size: int
+    input_positions: torch.Tensor
     query_start_loc: torch.Tensor
     cp_metadata: DSACPMetadata
+    input_positions_cpu: torch.Tensor | None = None
+    query_start_loc_cpu: torch.Tensor | None = None
     num_compressed_tokens: int | None = None
+    request_ids: list[str] | None = None
     sin: torch.Tensor = None
     cos: torch.Tensor = None
     full_compress_sin: torch.Tensor = None
@@ -182,6 +944,14 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.seq_lens_cpu: torch.Tensor = None
 
         self.compressor_ratio = getattr(kv_cache_spec, "compress_ratio", 0)
+        self.enable_dsa_cp_local_cache = ascend_envs.VLLM_ASCEND_ENABLE_DSA_CP_LOCAL_CACHE
+        try:
+            tp_group = get_tp_group()
+            self.cp_size = tp_group.world_size
+            self.cp_rank = tp_group.rank_in_group
+        except Exception:
+            self.cp_size = 1
+            self.cp_rank = 0
         hf_config = self.model_config.hf_config
 
         if AscendDSACPMetadataBuilder.hadamard is None:
@@ -376,25 +1146,33 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.num_decode_tokens = num_decode_tokens
         self.num_actual_tokens = common_attn_metadata.num_actual_tokens
         self.seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+        if common_attn_metadata._seq_lens_cpu is not None:
+            self.seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+        elif common_attn_metadata.seq_lens_cpu is not None:
+            self.seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        else:
+            self.seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
         self.block_size = kwargs.get("block_size", 128)
 
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
+        input_positions_cpu = common_attn_metadata.positions_cpu[:num_input_tokens].long()
         # Draft steps update positions independently. Reusing the global RoPE
         # cache can let later draft steps overwrite step-0 metadata.
         cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=False)
 
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
+        formatted_slot_mapping = DeviceOperator.format_dsa_slot_mapping(slot_mapping, self.block_size)
 
         assert self.spec_slot_mapping is not None
-        self.spec_slot_mapping[draft_index - 1][:num_input_tokens] = DeviceOperator.format_dsa_slot_mapping(
-            slot_mapping, self.block_size
-        )
+        self.spec_slot_mapping[draft_index - 1][:num_input_tokens] = formatted_slot_mapping
+        self.slot_mapping[:num_input_tokens] = formatted_slot_mapping
 
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         req_metadata = self.build_req_metadata_for_drafting(
             draft_index=draft_index,
             common_attn_metadata=common_attn_metadata,
             input_positions=input_positions,
+            input_positions_cpu=input_positions_cpu,
             num_input_tokens=num_input_tokens,
         )
 
@@ -421,6 +1199,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         draft_index: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         input_positions: torch.Tensor,
+        input_positions_cpu: torch.Tensor,
         num_input_tokens: int,
     ) -> AscendDSAReqMetadata:
         """Build DSA-CP metadata for one draft step."""
@@ -431,6 +1210,13 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         has_prefill = _has_prefill(common_attn_metadata.attn_state)
 
         cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=False)
+        local_cache_plan = (
+            self._build_local_cache_plan(
+                num_input_tokens, query_start_loc_cpu[: num_reqs + 1].tolist()
+            )
+            if has_prefill
+            else None
+        )
         (
             local_start,
             local_end_with_pad,
@@ -449,6 +1235,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             use_cache=False,
             local_query_start_loc=self.spec_local_query_start_loc[draft_index - 1],
             local_seq_lens=self.spec_local_seq_lens[draft_index - 1],
+            local_cache_plan=local_cache_plan,
         )
         local_query_start_loc = local_query_start_loc.clone()
         local_seq_lens = local_seq_lens.clone()
@@ -460,6 +1247,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             query_start_loc=query_start_loc_cpu,
             seq_lens=self.seq_lens_cpu[:num_reqs],
             use_cache=False,
+            local_cache_plan=local_cache_plan,
         )
         local_seq_lens_q_cpu = local_query_start_loc_cpu[1 : num_reqs + 1] - local_query_start_loc_cpu[:num_reqs]
         max_local_query_len = max(1, int(local_seq_lens_q_cpu.max().item()))
@@ -469,6 +1257,22 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         assert self.spec_slot_mapping is not None
         slot_mapping = self.spec_slot_mapping[draft_index - 1][: self.num_actual_tokens]
+        actual_num_tokens = self.num_actual_tokens
+        swa_slot_mapping, swa_valid_start, swa_valid_end = self._build_swa_local_slot_mapping(
+            local_cache_plan, actual_num_tokens
+        )
+        swa_window_plan = self._build_swa_window_plan(
+            local_cache_plan, query_start_loc_cpu[: num_reqs + 1].tolist(), actual_num_tokens
+        )
+        swa_hidden_input_plan = (
+            build_dsa_cp_hidden_input_plan(
+                input_ranges=swa_window_plan.input_ranges,
+                local_cache_plan=local_cache_plan,
+                num_actual_tokens=actual_num_tokens,
+            )
+            if local_cache_plan is not None and swa_window_plan is not None
+            else None
+        )
 
         num_heads = self.model_config.hf_config.num_attention_heads
         metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()
@@ -521,16 +1325,27 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             num_tokens_pad=num_tokens_pad,
             local_sin=local_sin,
             local_cos=local_cos,
+            local_cache_plan=local_cache_plan,
+            swa_window_plan=swa_window_plan,
+            swa_hidden_input_plan=swa_hidden_input_plan,
+            swa_slot_mapping=swa_slot_mapping,
+            swa_valid_start=swa_valid_start,
+            swa_valid_end=swa_valid_end,
         )
 
         return AscendDSAReqMetadata(
             input_positions=input_positions,
+            input_positions_cpu=input_positions_cpu[: self.num_actual_tokens] if has_prefill else None,
             block_table=self.block_table[:num_reqs, ...],
             slot_mapping=slot_mapping,
             block_size=self.block_size,
             seq_lens=self.seq_lens[:num_reqs],
             query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu[: num_reqs + 1] if has_prefill else None,
             cp_metadata=cp_metadata,
+            request_ids=common_attn_metadata.request_ids[:num_reqs]
+            if common_attn_metadata.request_ids is not None
+            else None,
             sin=sin,
             cos=cos,
             start_pos=start_pos,
@@ -546,6 +1361,19 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         assert self.num_actual_tokens is not None
         num_tokens = self.num_actual_tokens
         return min(num_tokens, num_tokens // self.compressor_ratio + common_attn_metadata.num_reqs)
+
+    def _get_slot_mapping_size(
+        self,
+        input_positions_cpu: torch.Tensor,
+        compress_ratio: int,
+        num_reqs: int,
+        num_actual_tokens: int,
+    ) -> int:
+        if compress_ratio <= 1:
+            return num_actual_tokens
+        # Compressor metadata produces at most one compressed row per ratio
+        # group plus one boundary row per request, capped by valid tokens.
+        return min(num_actual_tokens, num_actual_tokens // compress_ratio + num_reqs)
 
     def build_req_metadata(
         self,
@@ -567,6 +1395,13 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # cos/sin for all tokens
         cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=not has_prefill)
 
+        local_cache_plan = (
+            self._build_local_cache_plan(
+                num_input_tokens, query_start_loc_cpu[: num_reqs + 1].tolist()
+            )
+            if has_prefill
+            else None
+        )
         (
             local_start,
             local_end_with_pad,
@@ -585,6 +1420,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             use_cache=not has_prefill,
             local_query_start_loc=self.local_query_start_loc,
             local_seq_lens=self.local_seq_lens,
+            local_cache_plan=local_cache_plan,
         )
         local_seq_lens_q = local_query_start_loc[1 : num_reqs + 1] - local_query_start_loc[:num_reqs]
 
@@ -595,6 +1431,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             query_start_loc=query_start_loc_cpu,
             seq_lens=self.seq_lens_cpu[:num_reqs],
             use_cache=False,
+            local_cache_plan=local_cache_plan,
         )
         local_seq_lens_q_cpu = local_query_start_loc_cpu[1 : num_reqs + 1] - local_query_start_loc_cpu[:num_reqs]
         max_local_query_len = max(1, int(local_seq_lens_q_cpu.max().item()))
@@ -615,20 +1452,86 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 self.start_pos_prefill[num_reqs_actual:].fill_(0)
                 self.block_table[num_reqs_actual:num_reqs, ...].fill_(0)
 
+        # --- Local SWA/window cache owner mapping ---
+        actual_num_tokens = self.num_actual_tokens
+        swa_slot_mapping, swa_valid_start, swa_valid_end = self._build_swa_local_slot_mapping(
+            local_cache_plan, actual_num_tokens
+        )
+        swa_window_plan = self._build_swa_window_plan(
+            local_cache_plan, query_start_loc_cpu[: num_reqs + 1].tolist(), actual_num_tokens
+        )
+
         # --- Compressed positions ---
         full_compress_cos, full_compress_sin = None, None
+        num_compressed_tokens = None
+        compressed_slot_mapping = None
+        compressed_valid_start = 0
+        compressed_valid_end = 0
+        compressor_slot_plan = None
+        state_broadcast_plan = None
+        swa_hidden_input_plan = None
+        compressor_hidden_input_plan = None
         cu_cmp_seqlens = self._get_cmp_seqlens_for_metadata(has_prefill)
+        actual_input_positions_cpu = input_positions_cpu[:actual_num_tokens]
+        slot_mapping_size = self._get_slot_mapping_size(
+            actual_input_positions_cpu, self.compressor_ratio, num_reqs, actual_num_tokens
+        )
+        slot_mapping = self.slot_mapping[:slot_mapping_size]
+        (
+            compressed_slot_mapping,
+            compressed_valid_start,
+            compressed_valid_end,
+        ) = self._build_compressed_local_slot_mapping(
+            local_cache_plan=local_cache_plan,
+            input_positions=actual_input_positions_cpu,
+            num_actual_tokens=actual_num_tokens,
+            compress_ratio=self.compressor_ratio,
+        )
+        compressor_slot_plan = self._build_local_compressor_slot_plan(
+            local_cache_plan=local_cache_plan,
+            input_positions=actual_input_positions_cpu,
+            slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc_cpu[: num_reqs + 1].tolist(),
+            num_actual_tokens=actual_num_tokens,
+            compress_ratio=self.compressor_ratio,
+            request_ids=common_attn_metadata.request_ids[:num_reqs]
+            if common_attn_metadata.request_ids is not None
+            else None,
+        )
+        state_broadcast_plan = self._build_state_broadcast_plan(
+            local_cache_plan=local_cache_plan,
+            query_start_loc=query_start_loc_cpu[: num_reqs + 1].tolist(),
+            num_actual_tokens=actual_num_tokens,
+            input_positions=actual_input_positions_cpu,
+        )
+        swa_hidden_input_plan = (
+            build_dsa_cp_hidden_input_plan(
+                input_ranges=swa_window_plan.input_ranges,
+                local_cache_plan=local_cache_plan,
+                num_actual_tokens=actual_num_tokens,
+            )
+            if local_cache_plan is not None and swa_window_plan is not None
+            else None
+        )
+        compressor_hidden_input_plan = (
+            build_dsa_cp_hidden_input_plan(
+                input_ranges=compressor_slot_plan.input_ranges,
+                local_cache_plan=local_cache_plan,
+                num_actual_tokens=actual_num_tokens,
+            )
+            if local_cache_plan is not None and compressor_slot_plan is not None
+            else None
+        )
 
         if self.compressor_ratio > 1:
             layer_name = f"c{self.compressor_ratio}"
-            # Keep only graph inputs here. The compressor metadata op itself is
-            # launched in forward at the real compressor consumer.
+            # Keep graph inputs here. The actual compressor slot mapping is
+            # produced by the metadata op in forward unless local-cache CP
+            # supplies an owner-only slot plan.
             num_compressed_tokens = self._num_compressor_metadata_rows(common_attn_metadata)
             full_compress_cos, full_compress_sin = get_full_cos_and_sin_dsa(layer_name)
-            slot_mapping = None
-        else:
-            num_compressed_tokens = None
-            slot_mapping = self.slot_mapping[: self.num_actual_tokens]
+            if compressor_slot_plan is None:
+                slot_mapping = None
 
         # --- SAS metadata (all requests combined) ---
         num_heads = self.model_config.hf_config.num_attention_heads
@@ -664,16 +1567,33 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             num_tokens_pad=num_tokens_pad,
             local_sin=local_sin,
             local_cos=local_cos,
+            local_cache_plan=local_cache_plan,
+            swa_window_plan=swa_window_plan,
+            swa_hidden_input_plan=swa_hidden_input_plan,
+            swa_slot_mapping=swa_slot_mapping,
+            swa_valid_start=swa_valid_start,
+            swa_valid_end=swa_valid_end,
+            compressor_slot_plan=compressor_slot_plan,
+            compressor_hidden_input_plan=compressor_hidden_input_plan,
+            state_broadcast_plan=state_broadcast_plan,
+            compressed_slot_mapping=compressed_slot_mapping,
+            compressed_valid_start=compressed_valid_start,
+            compressed_valid_end=compressed_valid_end,
         )
 
         return AscendDSAReqMetadata(
             input_positions=input_positions,
+            input_positions_cpu=input_positions_cpu[: self.num_actual_tokens] if has_prefill else None,
             block_table=self.block_table[:num_reqs, ...],
             slot_mapping=slot_mapping,
             block_size=self.block_size,
             seq_lens=self.seq_lens[:num_reqs],
             query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu[: num_reqs + 1] if has_prefill else None,
             cp_metadata=cp_metadata,
+            request_ids=common_attn_metadata.request_ids[:num_reqs]
+            if common_attn_metadata.request_ids is not None
+            else None,
             sin=sin,
             cos=cos,
             full_compress_sin=full_compress_sin,
@@ -686,6 +1606,115 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             cu_cmp_seqlen_list=cu_cmp_seqlens,
         )
 
+    def _build_local_cache_plan(
+        self, num_input_tokens: int, query_start_loc: list[int] | None = None
+    ) -> DSACPLocalCachePlan | None:
+        if not self.enable_dsa_cp_local_cache or self.cp_size <= 1:
+            return None
+
+        return build_dsa_cp_local_cache_plan(
+            num_input_tokens=num_input_tokens,
+            cp_size=self.cp_size,
+            cp_rank=self.cp_rank,
+            query_start_loc=query_start_loc,
+        )
+
+    def _build_swa_local_slot_mapping(
+        self,
+        local_cache_plan: DSACPLocalCachePlan | None,
+        num_actual_tokens: int,
+    ) -> tuple[torch.Tensor | None, int, int]:
+        if local_cache_plan is None:
+            return None, 0, 0
+
+        slot_mappings = []
+        for valid_start, valid_end in local_cache_plan.local_valid_ranges:
+            valid_start = min(valid_start, num_actual_tokens)
+            valid_end = min(valid_end, num_actual_tokens)
+            if valid_start < valid_end:
+                slot_mappings.append(self.slot_mapping[valid_start:valid_end])
+        if not slot_mappings:
+            return self.slot_mapping[:0], 0, 0
+        return torch.cat(slot_mappings, dim=0), 0, sum(
+            end - start for start, end in local_cache_plan.local_valid_ranges
+        )
+
+    def _build_swa_window_plan(
+        self,
+        local_cache_plan: DSACPLocalCachePlan | None,
+        query_start_loc: list[int],
+        num_actual_tokens: int,
+    ) -> DSACPSWAWindowPlan | None:
+        if local_cache_plan is None:
+            return None
+        return build_dsa_cp_swa_window_plan(
+            local_cache_plan=local_cache_plan,
+            query_start_loc=query_start_loc,
+            num_actual_tokens=num_actual_tokens,
+            slot_mapping=self.slot_mapping,
+        )
+
+    def _build_compressed_local_slot_mapping(
+        self,
+        local_cache_plan: DSACPLocalCachePlan | None,
+        input_positions: torch.Tensor,
+        num_actual_tokens: int,
+        compress_ratio: int,
+    ) -> tuple[torch.Tensor | None, int, int]:
+        if local_cache_plan is None or compress_ratio <= 1:
+            return None, 0, 0
+
+        compressed_start, compressed_end = build_dsa_cp_local_compressed_range(
+            input_positions=input_positions,
+            compress_ratio=compress_ratio,
+            local_cache_plan=local_cache_plan,
+            num_actual_tokens=num_actual_tokens,
+        )
+        return self.slot_mapping[compressed_start:compressed_end], compressed_start, compressed_end
+
+    def _build_local_compressor_slot_plan(
+        self,
+        local_cache_plan: DSACPLocalCachePlan | None,
+        input_positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        query_start_loc: list[int],
+        num_actual_tokens: int,
+        compress_ratio: int,
+        request_ids: list[str] | None = None,
+    ) -> DSACPCompressorSlotPlan | None:
+        if local_cache_plan is None or compress_ratio <= 1:
+            return None
+
+        return build_dsa_cp_local_compressor_slot_plan(
+            input_positions=input_positions,
+            slot_mapping=slot_mapping,
+            compress_ratio=compress_ratio,
+            local_cache_plan=local_cache_plan,
+            query_start_loc=query_start_loc,
+            num_actual_tokens=num_actual_tokens,
+            overlap_tokens=compress_ratio,
+            request_ids=request_ids,
+        )
+
+    def _build_state_broadcast_plan(
+        self,
+        local_cache_plan: DSACPLocalCachePlan | None,
+        query_start_loc: list[int],
+        num_actual_tokens: int,
+        input_positions: torch.Tensor,
+    ) -> DSACPStateBroadcastPlan | None:
+        if local_cache_plan is None:
+            return None
+        return build_dsa_cp_state_broadcast_plan(
+            local_cache_plan=local_cache_plan,
+            query_start_loc=query_start_loc,
+            num_actual_tokens=num_actual_tokens,
+            input_positions=input_positions,
+            state_block_table=self.block_table,
+            compress_ratio=max(1, self.compressor_ratio),
+            state_block_size=self.block_size,
+        )
+
     def _build_local_token_metadata(
         self,
         num_reqs,
@@ -696,6 +1725,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         use_cache,
         local_query_start_loc=None,
         local_seq_lens=None,
+        local_cache_plan: DSACPLocalCachePlan | None = None,
     ):
         """
         For example:
@@ -712,56 +1742,115 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         local_reqs_mask = [0, 0, 0, 0, 0, 1, 1, 1, 0]
         local_seq_lens = [0, 0, 0, 0, 0, 6, 7, 2, 0]
         """
-        tp_group = get_tp_group()
-        tp_size = tp_group.world_size
-        tp_rank = tp_group.rank_in_group
-        # Split the flattened token stream evenly across TP ranks. Padding keeps
-        # every rank's local slice the same length, which simplifies CP kernels.
-        num_tokens_pad = ((num_input_tokens + tp_size - 1) // tp_size) * tp_size
-        tokens_per_rank = num_tokens_pad // tp_size
-        local_start = tp_rank * tokens_per_rank
-        local_end = local_start + tokens_per_rank
+        if local_cache_plan is None:
+            tp_group = get_tp_group()
+            tp_size = tp_group.world_size
+            tp_rank = tp_group.rank_in_group
+            # Split the flattened token stream evenly across TP ranks. Padding keeps
+            # every rank's local slice the same length, which simplifies CP kernels.
+            num_tokens_pad = ((num_input_tokens + tp_size - 1) // tp_size) * tp_size
+            tokens_per_rank = num_tokens_pad // tp_size
+            local_start = tp_rank * tokens_per_rank
+            local_end = local_start + tokens_per_rank
 
-        if local_query_start_loc is not None:
-            local_query_start_loc.fill_(0)
-            local_seq_lens.fill_(0)
+            if local_query_start_loc is not None:
+                local_query_start_loc.fill_(0)
+                local_seq_lens.fill_(0)
 
-        # Intersect each request's global token interval with this rank's local
-        # token interval, then build the per-rank query_start_loc from lengths.
-        local_query_start = torch.clamp(query_start_loc[:-1], min=local_start, max=local_end)
-        local_query_end = torch.clamp(query_start_loc[1:], min=local_start, max=local_end)
-        local_query_lens = local_query_end - local_query_start
-        if local_query_start_loc is not None:
-            local_query_start_loc[1 : num_reqs + 1] = torch.cumsum(local_query_lens, dim=0)
+            local_query_start = torch.clamp(query_start_loc[:-1], min=local_start, max=local_end)
+            local_query_end = torch.clamp(query_start_loc[1:], min=local_start, max=local_end)
+            local_query_lens = local_query_end - local_query_start
+            if local_query_start_loc is not None:
+                local_query_start_loc[1 : num_reqs + 1] = torch.cumsum(local_query_lens, dim=0)
+            else:
+                local_query_start_loc = torch.cat(
+                    [
+                        torch.tensor([0], dtype=local_query_lens.dtype, device=local_query_lens.device),
+                        torch.cumsum(local_query_lens, dim=0),
+                    ],
+                    0,
+                )
+
+            offset = query_start_loc[1:] - local_query_end
+            if local_seq_lens is not None:
+                local_seq_lens[:num_reqs] = (local_query_lens > 0) * (seq_lens - offset)
+            else:
+                local_seq_lens = (local_query_lens > 0) * (seq_lens - offset)
+
+            if input_positions is not None:
+                pad_tokens = num_tokens_pad - input_positions.shape[0]
+                if pad_tokens > 0:
+                    input_positions = F.pad(input_positions, (0, pad_tokens), value=0)
+                local_cos, local_sin = get_cos_and_sin_dsa(input_positions, use_cache=use_cache)
+                local_cos = local_cos[local_start:local_end]
+                local_sin = local_sin[local_start:local_end]
+            else:
+                local_cos = None
+                local_sin = None
         else:
-            local_query_start_loc = torch.cat(
-                [
-                    torch.tensor([0], dtype=local_query_lens.dtype, device=local_query_lens.device),
-                    torch.cumsum(local_query_lens, dim=0),
-                ],
-                0,
+            local_start = local_cache_plan.local_start
+            local_end = local_cache_plan.local_end
+            tokens_per_rank = local_cache_plan.tokens_per_rank
+            num_tokens_pad = local_cache_plan.num_tokens_pad
+
+            if local_query_start_loc is not None:
+                local_query_start_loc.fill_(0)
+                local_seq_lens.fill_(0)
+
+            query_lens: list[int] = []
+            tail_offsets: list[int] = []
+            request_starts = local_cache_plan.query_start_loc
+            local_rank_ranges = local_cache_plan.rank_valid_ranges[local_cache_plan.cp_rank]
+            for req_idx in range(num_reqs):
+                req_start = min(int(request_starts[req_idx]), num_input_tokens)
+                req_end = min(int(request_starts[req_idx + 1]), num_input_tokens)
+                if req_idx >= len(local_rank_ranges):
+                    query_lens.append(0)
+                    tail_offsets.append(0)
+                    continue
+                valid_start, valid_end = local_rank_ranges[req_idx]
+                valid_start = max(req_start, min(valid_start, num_input_tokens))
+                valid_end = min(req_end, min(valid_end, num_input_tokens))
+                local_query_len = max(0, valid_end - valid_start)
+                query_lens.append(local_query_len)
+                tail_offsets.append(req_end - valid_end if local_query_len > 0 else 0)
+
+            local_query_lens = torch.tensor(query_lens, dtype=query_start_loc.dtype, device=query_start_loc.device)
+            if local_query_start_loc is not None:
+                local_query_start_loc[1 : num_reqs + 1] = torch.cumsum(local_query_lens, dim=0)
+            else:
+                local_query_start_loc = torch.cat(
+                    [
+                        torch.tensor([0], dtype=local_query_lens.dtype, device=local_query_lens.device),
+                        torch.cumsum(local_query_lens, dim=0),
+                    ],
+                    0,
+                )
+            tail_offsets_tensor = torch.tensor(tail_offsets, dtype=seq_lens.dtype, device=seq_lens.device)
+            local_query_lens_for_seq = local_query_lens.to(device=seq_lens.device)
+            local_seq_lens_tensor = torch.where(
+                local_query_lens_for_seq > 0,
+                seq_lens[:num_reqs] - tail_offsets_tensor,
+                torch.zeros_like(seq_lens[:num_reqs]),
             )
+            if local_seq_lens is not None:
+                local_seq_lens[:num_reqs] = local_seq_lens_tensor
+            else:
+                local_seq_lens = local_seq_lens_tensor
 
-        # For requests that cross the local slice boundary, offset removes the
-        # tokens that live on later ranks so local_seq_lens matches local queries.
-        offset = query_start_loc[1:] - local_query_end
-        if local_seq_lens is not None:
-            local_seq_lens[:num_reqs] = (local_query_lens > 0) * (seq_lens - offset)
-        else:
-            local_seq_lens = (local_query_lens > 0) * (seq_lens - offset)
-
-        # RoPE tables are generated on the padded global positions first, then
-        # sliced to this rank so local tokens keep their original positions.
-        if input_positions is not None:
-            pad_tokens = num_tokens_pad - input_positions.shape[0]
-            if pad_tokens > 0:
-                input_positions = F.pad(input_positions, (0, pad_tokens), value=0)
-            local_cos, local_sin = get_cos_and_sin_dsa(input_positions, use_cache=use_cache)
-            local_cos = local_cos[local_start:local_end]
-            local_sin = local_sin[local_start:local_end]
-        else:
-            local_cos = None
-            local_sin = None
+            if input_positions is not None:
+                cos, sin = get_cos_and_sin_dsa(input_positions[:num_input_tokens], use_cache=use_cache)
+                if local_cache_plan.local_valid_ranges:
+                    local_cos, local_sin = concatenate_rope_slices(
+                        cos,
+                        local_cache_plan.local_valid_ranges,
+                    )
+                else:
+                    local_cos = cos[:0]
+                    local_sin = sin[:0]
+            else:
+                local_cos = None
+                local_sin = None
         return (
             local_start,
             local_end,
@@ -1012,6 +2101,10 @@ class AscendDSACPImpl(DSAAttentionImpl):
             self.compressor_norm = self.compressor.norm
             self.compressor_norm_eps = self.compressor.norm_eps
 
+        self._dsa_cp_hidden_tail_cache: dict[str, dict[str, tuple[int, torch.Tensor]]] = {}
+        self._cached_compressor_kv_trailing: tuple[int, ...] | None = None
+        self._cached_indexer_kv_trailing: tuple[int, ...] | None = None
+
     def _compute_compressor_metadata(
         self,
         metadata: AscendDSAReqMetadata,
@@ -1170,10 +2263,33 @@ class AscendDSACPImpl(DSAAttentionImpl):
         self,
         o_proj_input: torch.Tensor,
         full_weight: bool,
+        skip_tp_reduce: bool = False,
     ) -> torch.Tensor:
-        if not full_weight:
+        if not full_weight and not skip_tp_reduce:
             return self.wo_b(o_proj_input)
         return self.wo_b.quant_method.apply(self.wo_b, o_proj_input, bias=None)
+
+    def _reduce_scatter_dsa_cp_o_proj_output(
+        self,
+        o_proj_output: torch.Tensor,
+        local_cache_plan: DSACPLocalCachePlan,
+        exchange_num_tokens: int,
+    ) -> torch.Tensor:
+        if self.tp_size == 1:
+            return o_proj_output[: local_cache_plan.local_num_tokens]
+        expected_num_tokens = self.tp_size * exchange_num_tokens
+        if o_proj_output.shape[0] != expected_num_tokens:
+            raise RuntimeError(
+                "DSA CP local-cache o_proj reduce_scatter got unexpected token count: "
+                f"expected={expected_num_tokens}, got={o_proj_output.shape[0]}."
+            )
+        reduced = torch.empty(
+            (exchange_num_tokens, o_proj_output.shape[-1]),
+            dtype=o_proj_output.dtype,
+            device=o_proj_output.device,
+        )
+        dist.reduce_scatter_tensor(reduced, o_proj_output.contiguous(), group=self.tp_group.device_group)
+        return reduced[: local_cache_plan.local_num_tokens]
 
     def forward(  # type: ignore[override]
         self,
@@ -1190,9 +2306,13 @@ class AscendDSACPImpl(DSAAttentionImpl):
             return output.fill_(0)
         if not isinstance(attn_metadata, list):
             attn_metadata = [attn_metadata]
+        assert attn_metadata[0].req_metadata is not None
+        first_cp_metadata = attn_metadata[0].req_metadata.cp_metadata
+        use_local_cache_cp = first_cp_metadata.local_cache_plan is not None
         full_gather_wo_a_enabled = (
             self.tp_size > 1
             and self.enable_dsa_cp_with_o_proj_tp
+            and not use_local_cache_cp
             and attn_metadata[0].attn_state
             not in {
                 AscendAttentionState.DecodeOnly,
@@ -1213,7 +2333,17 @@ class AscendDSACPImpl(DSAAttentionImpl):
             attn_metadata[0],
             skip_all_to_all=full_gather_wo_a_enabled,
         )
+        if isinstance(o_proj_input, tuple):
+            o_proj_input, dsa_cp_exchange_num_tokens = o_proj_input
+        else:
+            dsa_cp_exchange_num_tokens = None
         num_tokens = o_proj_input.shape[0]
+        local_cache_plan = first_cp_metadata.local_cache_plan
+        use_dsa_cp_local_output = (
+            local_cache_plan is not None
+            and dsa_cp_exchange_num_tokens is not None
+            and not full_gather_wo_a_enabled
+        )
 
         # o
         if full_gather_wo_a_enabled:
@@ -1236,7 +2366,14 @@ class AscendDSACPImpl(DSAAttentionImpl):
                     perm_y=(1, 0, 2),
                 )
                 o = o.reshape(num_tokens, -1)
-                output[...] = self._apply_wo_b(o, full_gather_wo_a_enabled)
+                o = self._apply_wo_b(o, full_gather_wo_a_enabled, skip_tp_reduce=use_dsa_cp_local_output)
+                if use_dsa_cp_local_output:
+                    assert local_cache_plan is not None
+                    assert dsa_cp_exchange_num_tokens is not None
+                    o = self._reduce_scatter_dsa_cp_o_proj_output(
+                        o, local_cache_plan, dsa_cp_exchange_num_tokens
+                    )
+                output[...] = o
             else:
                 o_proj_input = o_proj_input.view(num_tokens, o_proj_groups, -1)
                 if olora_tp_enable():
@@ -1255,12 +2392,452 @@ class AscendDSACPImpl(DSAAttentionImpl):
                         batch_split_factor=1,
                     )
                 o_proj_input = o_proj_input.reshape(num_tokens, -1)
-                output[...] = self._apply_wo_b(o_proj_input, full_gather_wo_a_enabled)
+                o = self._apply_wo_b(
+                    o_proj_input, full_gather_wo_a_enabled, skip_tp_reduce=use_dsa_cp_local_output
+                )
+                if use_dsa_cp_local_output:
+                    assert local_cache_plan is not None
+                    assert dsa_cp_exchange_num_tokens is not None
+                    o = self._reduce_scatter_dsa_cp_o_proj_output(
+                        o, local_cache_plan, dsa_cp_exchange_num_tokens
+                    )
+                output[...] = o
         finally:
             if full_gather_wo_a_enabled:
                 self._switch_o_proj_to_tp_weight()
 
         return output
+
+    def _get_tp_global_rank(self, group_rank: int) -> int:
+        if hasattr(self.tp_group, "ranks"):
+            return self.tp_group.ranks[group_rank]
+        return dist.get_global_rank(self.tp_group.device_group, group_rank)
+
+    @staticmethod
+    def _select_dsa_cp_hidden_ranges(
+        hidden_states: torch.Tensor,
+        ranges: list[tuple[int, int]],
+    ) -> torch.Tensor:
+        if not ranges:
+            return hidden_states[:0]
+        if len(ranges) == 1:
+            start, end = ranges[0]
+            return hidden_states[start:end]
+        return torch.cat([hidden_states[start:end] for start, end in ranges], dim=0)
+
+    def _gather_dsa_cp_hidden_halos(
+        self,
+        hidden_states_local: torch.Tensor,
+        local_cache_plan: DSACPLocalCachePlan | None,
+        num_actual_tokens: int,
+    ) -> tuple[list[torch.Tensor], list[tuple[int, int]]] | None:
+        if local_cache_plan is None or self.tp_size <= 1:
+            return None
+        if self.tp_group.device_group is None:
+            raise RuntimeError("DSA CP local-cache hidden halo gather requires a TP process group.")
+        if local_cache_plan.cp_size != self.tp_size:
+            raise RuntimeError(
+                "DSA CP local-cache hidden halo rank count mismatch: "
+                f"expected {self.tp_size}, got {local_cache_plan.cp_size}."
+            )
+
+        halo_size = local_cache_plan.unit_size
+        num_reqs = max(0, len(local_cache_plan.query_start_loc) - 1)
+        local_tail = hidden_states_local.new_zeros((num_reqs * halo_size, *hidden_states_local.shape[1:]))
+        local_offset_by_range = {
+            local_range: local_offset
+            for local_range, local_offset in zip(local_cache_plan.local_valid_ranges, local_cache_plan.local_offsets)
+        }
+        for req_idx, valid_range in enumerate(local_cache_plan.rank_valid_ranges[local_cache_plan.cp_rank]):
+            valid_start, valid_end = valid_range
+            valid_start = min(valid_start, num_actual_tokens)
+            valid_end = min(valid_end, num_actual_tokens)
+            if valid_start >= valid_end:
+                continue
+            compact_offset = local_offset_by_range.get((valid_start, valid_end))
+            if compact_offset is None:
+                continue
+            tail_start = max(valid_start, valid_end - halo_size)
+            tail_len = valid_end - tail_start
+            local_read_start = compact_offset + tail_start - valid_start
+            local_read_end = local_read_start + tail_len
+            local_write_start = req_idx * halo_size
+            local_tail[local_write_start : local_write_start + tail_len].copy_(
+                hidden_states_local[local_read_start:local_read_end]
+            )
+
+        gathered_tails = [torch.empty_like(local_tail) for _ in range(local_cache_plan.cp_size)]
+        dist.all_gather(gathered_tails, local_tail.contiguous(), group=self.tp_group.device_group)
+
+        halo_buffers: list[torch.Tensor] = []
+        halo_ranges: list[tuple[int, int]] = []
+        for source_rank, rank_ranges in enumerate(local_cache_plan.rank_valid_ranges):
+            for req_idx, (source_start, source_end) in enumerate(rank_ranges):
+                source_start = min(source_start, num_actual_tokens)
+                source_end = min(source_end, num_actual_tokens)
+                if source_start >= source_end:
+                    continue
+                halo_start = max(source_start, source_end - halo_size)
+                tail_offset = req_idx * halo_size
+                halo_buffers.append(gathered_tails[source_rank][tail_offset : tail_offset + source_end - halo_start])
+                halo_ranges.append((halo_start, source_end))
+
+        return halo_buffers, halo_ranges
+
+    def _assemble_dsa_cp_hidden_input(
+        self,
+        hidden_input_plan: DSACPHiddenInputPlan,
+        hidden_states_local: torch.Tensor,
+        hidden_halos: tuple[list[torch.Tensor], list[tuple[int, int]]] | None,
+        hidden_states_full: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if hidden_input_plan.num_input_tokens == 0:
+            return hidden_states_local[:0]
+
+        if not hidden_input_plan.halo_source_ranges:
+            return self._select_dsa_cp_hidden_ranges(hidden_states_local, hidden_input_plan.local_read_ranges)
+
+        if hidden_halos is None:
+            if hidden_states_full is not None:
+                return self._select_dsa_cp_hidden_ranges(hidden_states_full, hidden_input_plan.input_ranges)
+            raise RuntimeError("DSA CP hidden input requires halo data, but no halo source is available.")
+
+        halo_buffers, halo_ranges = hidden_halos
+        assembled = hidden_states_local.new_empty((hidden_input_plan.num_input_tokens, *hidden_states_local.shape[1:]))
+        for (read_start, read_end), (out_start, out_end) in zip(
+            hidden_input_plan.local_read_ranges, hidden_input_plan.local_output_ranges
+        ):
+            assembled[out_start:out_end].copy_(hidden_states_local[read_start:read_end])
+
+        for (source_start, source_end), (out_start, out_end) in zip(
+            hidden_input_plan.halo_source_ranges, hidden_input_plan.halo_output_ranges
+        ):
+            copied = False
+            for buffer, (halo_start, halo_end) in zip(halo_buffers, halo_ranges):
+                if halo_start <= source_start and source_end <= halo_end:
+                    read_start = source_start - halo_start
+                    read_end = read_start + source_end - source_start
+                    assembled[out_start:out_end].copy_(buffer[read_start:read_end])
+                    copied = True
+                    break
+            if not copied:
+                if hidden_states_full is not None:
+                    assembled[out_start:out_end].copy_(hidden_states_full[source_start:source_end])
+                else:
+                    raise RuntimeError(
+                        "DSA CP hidden halo range is not covered by gathered rank tails: "
+                        f"range=({source_start}, {source_end})."
+                    )
+
+        return assembled
+
+    def _get_dsa_cp_request_tail_key(
+        self,
+        req_metadata_or_slot_plan: AscendDSAReqMetadata | DSACPCompressorSlotPlan,
+        req_idx: int,
+    ) -> str:
+        request_ids = getattr(req_metadata_or_slot_plan, "request_ids", None)
+        if request_ids is not None and req_idx < len(request_ids):
+            return request_ids[req_idx]
+        return f"idx:{req_idx}"
+
+    def _assemble_dsa_cp_compressor_hidden_input(
+        self,
+        layer_name: str,
+        slot_plan: DSACPCompressorSlotPlan,
+        hidden_input_plan: DSACPHiddenInputPlan,
+        hidden_states_local: torch.Tensor,
+        hidden_halos: tuple[list[torch.Tensor], list[tuple[int, int]]] | None,
+        hidden_states_full: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        current_hidden = self._assemble_dsa_cp_hidden_input(
+            hidden_input_plan, hidden_states_local, hidden_halos, hidden_states_full
+        )
+        if not slot_plan.has_prefix_hidden:
+            return current_hidden
+
+        tail_cache = self._dsa_cp_hidden_tail_cache.get(layer_name)
+        if tail_cache is None:
+            raise RuntimeError(
+                f"DSA CP local-cache layer {layer_name} requires previous hidden tail cache, but cache is empty."
+            )
+
+        prefix_lengths = slot_plan.prefix_lengths.tolist()
+        request_indices = slot_plan.request_indices_cpu.tolist()
+        current_start_positions = slot_plan.current_start_positions.tolist()
+        pieces = []
+        current_offset = 0
+        for (input_start, input_end), prefix_len, req_idx, current_start_pos in zip(
+            slot_plan.input_ranges, prefix_lengths, request_indices, current_start_positions
+        ):
+            current_len = input_end - input_start
+            if prefix_len > 0:
+                req_key = self._get_dsa_cp_request_tail_key(slot_plan, req_idx)
+                if req_key not in tail_cache:
+                    raise RuntimeError(
+                        "DSA CP local-cache missing previous hidden tail for chunk prefill: "
+                        f"layer={layer_name}, req_key={req_key}, prefix_len={prefix_len}."
+                    )
+                tail_end_pos, tail_hidden = tail_cache[req_key]
+                if tail_end_pos != current_start_pos or tail_hidden.shape[0] < prefix_len:
+                    raise RuntimeError(
+                        "DSA CP local-cache previous hidden tail does not match current chunk: "
+                        f"layer={layer_name}, req_key={req_key}, tail_end={tail_end_pos}, "
+                        f"current_start={current_start_pos}, tail_len={tail_hidden.shape[0]}, prefix_len={prefix_len}."
+                    )
+                pieces.append(tail_hidden[-prefix_len:].to(device=current_hidden.device, dtype=current_hidden.dtype))
+            pieces.append(current_hidden[current_offset : current_offset + current_len])
+            current_offset += current_len
+
+        if current_offset != current_hidden.shape[0]:
+            raise RuntimeError(
+                "DSA CP local-cache compressor hidden assembly consumed an unexpected number of current tokens: "
+                f"consumed={current_offset}, available={current_hidden.shape[0]}."
+            )
+        if not pieces:
+            return current_hidden[:0]
+        return torch.cat(pieces, dim=0)
+
+    def _save_dsa_cp_hidden_tail_cache(
+        self,
+        layer_name: str,
+        hidden_states_local: torch.Tensor,
+        hidden_halos: tuple[list[torch.Tensor], list[tuple[int, int]]] | None,
+        req_metadata: AscendDSAReqMetadata,
+        local_cache_plan: DSACPLocalCachePlan | None,
+        num_actual_tokens: int,
+    ) -> None:
+        if local_cache_plan is None:
+            self._dsa_cp_hidden_tail_cache.pop(layer_name, None)
+            return
+        input_positions_cpu = req_metadata.input_positions_cpu
+        query_start_loc_cpu = req_metadata.query_start_loc_cpu
+        if input_positions_cpu is None or query_start_loc_cpu is None:
+            return
+        query_start_list = query_start_loc_cpu.tolist()
+        input_positions_list = input_positions_cpu.tolist()
+        num_reqs = len(query_start_list) - 1
+        tail_ranges: list[tuple[int, int]] = []
+        tail_req_indices: list[int] = []
+        tail_end_positions: list[int] = []
+        for req_idx in range(num_reqs):
+            req_start = min(query_start_list[req_idx], num_actual_tokens)
+            req_end = min(query_start_list[req_idx + 1], num_actual_tokens)
+            if req_start >= req_end:
+                continue
+            tail_start = max(req_start, req_end - local_cache_plan.unit_size)
+            tail_ranges.append((tail_start, req_end))
+            tail_req_indices.append(req_idx)
+            tail_end_positions.append(input_positions_list[req_end - 1] + 1)
+
+        cache: dict[str, tuple[int, torch.Tensor]] = {}
+        if tail_ranges:
+            tail_plan = build_dsa_cp_hidden_input_plan(tail_ranges, local_cache_plan, num_actual_tokens)
+            tail_hidden = self._assemble_dsa_cp_hidden_input(tail_plan, hidden_states_local, hidden_halos)
+            offset = 0
+            for (tail_start, tail_end), req_idx, tail_end_pos in zip(tail_ranges, tail_req_indices, tail_end_positions):
+                tail_len = tail_end - tail_start
+                req_key = self._get_dsa_cp_request_tail_key(req_metadata, req_idx)
+                cache[req_key] = (tail_end_pos, tail_hidden[offset : offset + tail_len].detach().clone())
+                offset += tail_len
+        self._dsa_cp_hidden_tail_cache[layer_name] = cache
+
+    def _broadcast_dsa_cp_state_blocks(
+        self,
+        state_cache: torch.Tensor | None,
+        state_broadcast_plan: DSACPStateBroadcastPlan | None,
+    ) -> None:
+        if state_cache is None or state_broadcast_plan is None or self.tp_size <= 1:
+            return
+        if self.tp_group.device_group is None or state_broadcast_plan.state_block_ids.numel() == 0:
+            return
+
+        source_ranks = state_broadcast_plan.source_ranks.tolist()
+        state_block_ids = state_broadcast_plan.state_block_ids.tolist()
+        state_valid_mask = state_broadcast_plan.state_valid_mask.tolist()
+        for source_rank, state_block_id, state_valid in zip(source_ranks, state_block_ids, state_valid_mask):
+            if not state_valid or source_rank < 0 or state_block_id < 0:
+                continue
+
+            state_block = state_cache[int(state_block_id)]
+            if self.tp_rank == source_rank:
+                buffer = state_block.clone()
+            else:
+                buffer = torch.empty_like(state_block)
+            dist.broadcast(
+                buffer,
+                src=self._get_tp_global_rank(source_rank),
+                group=self.tp_group.device_group,
+            )
+            state_block.copy_(buffer)
+
+    def _all_gather_dsa_cp_cache_updates(
+        self,
+        local_update: torch.Tensor | None,
+        slot_plan: DSACPCompressorSlotPlan | DSACPSWAWindowPlan | None,
+        device: torch.device,
+        update_dtype: torch.dtype,
+        trailing_shape: tuple[int, ...],
+        apply_update,
+    ) -> None:
+        if slot_plan is None or self.tp_size <= 1:
+            return
+        all_rank_update_counts = getattr(
+            slot_plan,
+            "all_rank_valid_output_counts",
+            getattr(slot_plan, "all_rank_valid_token_counts", ()),
+        )
+        all_rank_slot_mappings = getattr(slot_plan, "all_rank_slot_mappings", ())
+        if self.tp_group.device_group is None or not all_rank_update_counts:
+            return
+        if len(all_rank_update_counts) != self.tp_size:
+            raise RuntimeError(
+                "DSA CP local cache update plan rank count mismatch: "
+                f"expected {self.tp_size}, got {len(all_rank_update_counts)}."
+            )
+        if len(all_rank_slot_mappings) != self.tp_size:
+            raise RuntimeError(
+                "DSA CP local cache slot mapping rank count mismatch: "
+                f"expected {self.tp_size}, got {len(all_rank_slot_mappings)}."
+            )
+
+        max_update_count = max(all_rank_update_counts)
+        if max_update_count <= 0:
+            return
+
+        local_count = all_rank_update_counts[self.tp_rank]
+        if local_update is not None and local_update.shape[0] != local_count:
+            raise RuntimeError(
+                "DSA CP local cache update count mismatch: "
+                f"expected {local_count}, got kv={local_update.shape[0]}."
+            )
+        if local_update is None and local_count != 0:
+            raise RuntimeError(
+                "DSA CP local cache update is missing for rank with valid outputs: "
+                f"rank={self.tp_rank}, expected={local_count}."
+            )
+
+        if local_update is None:
+            local_update = torch.zeros((0, *trailing_shape), dtype=update_dtype, device=device)
+        else:
+            local_trailing_shape = tuple(local_update.shape[1:])
+            if local_trailing_shape != trailing_shape:
+                raise RuntimeError(
+                    "DSA CP local cache update trailing shape mismatch: "
+                    f"expected={trailing_shape}, got={local_trailing_shape}."
+                )
+            if local_update.dtype != update_dtype:
+                raise RuntimeError(
+                    "DSA CP local cache update dtype mismatch: "
+                    f"expected={update_dtype}, got={local_update.dtype}."
+                )
+            local_update = local_update.contiguous()
+
+        padded_update = torch.zeros((max_update_count, *trailing_shape), dtype=update_dtype, device=device)
+        if local_update.shape[0] > 0:
+            padded_update[: local_update.shape[0]].copy_(local_update)
+
+        gathered_updates = [torch.empty_like(padded_update) for _ in range(self.tp_size)]
+        dist.all_gather(gathered_updates, padded_update, group=self.tp_group.device_group)
+
+        for source_rank, update_count in enumerate(all_rank_update_counts):
+            if update_count <= 0 or source_rank == self.tp_rank:
+                continue
+            source_update = gathered_updates[source_rank][:update_count]
+            source_slot_mapping = all_rank_slot_mappings[source_rank].to(device=device)
+            if source_slot_mapping.shape[0] != update_count:
+                raise RuntimeError(
+                    "DSA CP local cache slot mapping count mismatch: "
+                    f"rank={source_rank}, expected={update_count}, got={source_slot_mapping.shape[0]}."
+                )
+            apply_update(source_update, source_slot_mapping)
+
+    def _all_gather_dsa_cp_swa_cache_updates(
+        self,
+        swa_kv_cache: torch.Tensor | None,
+        local_update: torch.Tensor | None,
+        window_plan: DSACPSWAWindowPlan | None,
+    ) -> None:
+        if swa_kv_cache is None:
+            return
+
+        # SWA KV trailing shape is a model constant: (1, nope + rope).
+        update_dtype = local_update.dtype if local_update is not None else self.kv_norm.weight.dtype
+
+        def apply_update(update: torch.Tensor, slot_mapping: torch.Tensor) -> None:
+            DeviceOperator.dsa_kv_compress_scatter(swa_kv_cache, update, slot_mapping)
+
+        self._all_gather_dsa_cp_cache_updates(
+            local_update,
+            window_plan,
+            swa_kv_cache.device,
+            update_dtype,
+            (1, self.nope_head_dim + self.rope_head_dim),
+            apply_update,
+        )
+
+    def _all_gather_dsa_cp_compressed_cache_updates(
+        self,
+        compress_kv_cache: torch.Tensor | None,
+        local_update: torch.Tensor | None,
+        slot_plan: DSACPCompressorSlotPlan | None,
+    ) -> None:
+        if compress_kv_cache is None:
+            return
+
+        trailing_shape = (1, self.compressor_head_dim)
+        update_dtype = self.compressor_norm.weight.dtype
+        if local_update is not None:
+            self._cached_compressor_kv_trailing = local_update.shape[1:]
+            trailing_shape = self._cached_compressor_kv_trailing
+            update_dtype = local_update.dtype
+        elif self._cached_compressor_kv_trailing is not None:
+            trailing_shape = self._cached_compressor_kv_trailing
+
+        def apply_update(update: torch.Tensor, slot_mapping: torch.Tensor) -> None:
+            DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, update, slot_mapping)
+
+        self._all_gather_dsa_cp_cache_updates(
+            local_update,
+            slot_plan,
+            compress_kv_cache.device,
+            update_dtype,
+            trailing_shape,
+            apply_update,
+        )
+
+    def _all_gather_dsa_cp_indexer_cache_updates(
+        self,
+        indexer_k_cache: torch.Tensor,
+        indexer_scale_cache: torch.Tensor,
+        indexer_full_cache: torch.Tensor | None,
+        local_update: torch.Tensor | None,
+        slot_plan: DSACPCompressorSlotPlan | None,
+    ) -> None:
+        trailing_shape = (1, self.indexcom_head_dim)
+        update_dtype = self.indexcom_norm.weight.dtype
+        if local_update is not None:
+            self._cached_indexer_kv_trailing = local_update.shape[1:]
+            trailing_shape = self._cached_indexer_kv_trailing
+            update_dtype = local_update.dtype
+        elif self._cached_indexer_kv_trailing is not None:
+            trailing_shape = self._cached_indexer_kv_trailing
+
+        def apply_update(update: torch.Tensor, slot_mapping: torch.Tensor) -> None:
+            _, update_scale = DeviceOperator.indexer_quant_scatter_part1(
+                update, indexer_k_cache, indexer_full_cache, slot_mapping
+            )
+            if update_scale is not None:
+                DeviceOperator.dsa_indexer_scatter_scale_part3(update_scale, indexer_scale_cache, slot_mapping)
+
+        self._all_gather_dsa_cp_cache_updates(
+            local_update,
+            slot_plan,
+            indexer_k_cache.device,
+            update_dtype,
+            trailing_shape,
+            apply_update,
+        )
 
     def _forward(
         self,
@@ -1282,8 +2859,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
         else:
             (swa_metadata,) = attn_metadata
         common_attn_metadata = attn_metadata[0]
-
-        hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states_local, need_gather_q_kv)
+        hidden_states: torch.Tensor | None = None
 
         assert common_attn_metadata.req_metadata is not None
         assert swa_metadata.req_metadata is not None
@@ -1297,7 +2873,18 @@ class AscendDSACPImpl(DSAAttentionImpl):
         local_seq_lengths_query = cp_metadata.local_query_start_loc
         local_seq_lengths_key = cp_metadata.local_seq_lens
         has_prefill = _has_prefill(common_attn_metadata.attn_state)
-        hidden_states_cache = hidden_states[: common_attn_metadata.num_actual_tokens]
+        use_local_cache_prefill = has_prefill and cp_metadata.local_cache_plan is not None
+        hidden_halos = None
+        if use_local_cache_prefill:
+            hidden_halos = self._gather_dsa_cp_hidden_halos(
+                hidden_states_local,
+                cp_metadata.local_cache_plan,
+                common_attn_metadata.num_actual_tokens,
+            )
+            hidden_states_cache = hidden_states_local
+        else:
+            hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states_local, need_gather_q_kv)
+            hidden_states_cache = hidden_states[: common_attn_metadata.num_actual_tokens]
 
         if (not isinstance(self.wq_b.quant_method, AscendUnquantizedLinearMethod)) and isinstance(
             self.wq_b.quant_method.quant_method, AscendW8A8DynamicLinearMethod
@@ -1359,28 +2946,81 @@ class AscendDSACPImpl(DSAAttentionImpl):
 
         o_proj_full_handles = self._maybe_all_gather_o_proj_full_weight(full_gather_wo_a_enabled)
 
-        kv = self.wkv(hidden_states_cache)
-        kv = self.kv_norm(kv)
-        assert self.rope_head_dim is not None
-        kv = kv.view(-1, 1, self.nope_head_dim + self.rope_head_dim)
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            kv.unsqueeze(1),
-            cos[: kv.shape[0]],
-            sin[: kv.shape[0]],
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
-        )
-        DeviceOperator.dsa_kv_compress_scatter(swa_kv_cache, kv, swa_metadata.req_metadata.slot_mapping)
+        swa_req_metadata = swa_metadata.req_metadata
+        swa_cp_metadata = swa_req_metadata.cp_metadata
+        swa_hidden_states_cache = hidden_states_cache
+        swa_cos = cos
+        swa_sin = sin
+        swa_slot_mapping = swa_req_metadata.slot_mapping
+        swa_window_plan = None
+        if use_local_cache_prefill:
+            assert swa_cp_metadata.local_cache_plan is not None
+            swa_window_plan = swa_cp_metadata.swa_window_plan
+            swa_hidden_states_cache = hidden_states_local
+            if swa_cp_metadata.local_cache_plan.local_valid_ranges:
+                swa_cos, swa_sin = concatenate_rope_slices(
+                    cos,
+                    swa_cp_metadata.local_cache_plan.local_valid_ranges,
+                )
+            else:
+                swa_cos = cos[:0]
+                swa_sin = sin[:0]
+            assert swa_cp_metadata.swa_slot_mapping is not None
+            swa_slot_mapping = swa_cp_metadata.swa_slot_mapping
+
+        swa_kv = None
+        if swa_hidden_states_cache.numel() > 0:
+            swa_kv = self.wkv(swa_hidden_states_cache)
+            swa_kv = self.kv_norm(swa_kv)
+            assert self.rope_head_dim is not None
+            swa_kv = swa_kv.view(-1, 1, self.nope_head_dim + self.rope_head_dim)
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                swa_kv.unsqueeze(1),
+                swa_cos[: swa_kv.shape[0]],
+                swa_sin[: swa_kv.shape[0]],
+                rotary_mode="interleave",
+                partial_slice=[self.nope_head_dim, self.head_dim],
+            )
+            DeviceOperator.dsa_kv_compress_scatter(swa_kv_cache, swa_kv, swa_slot_mapping)
+
+        if swa_window_plan is not None:
+            self._all_gather_dsa_cp_swa_cache_updates(swa_kv_cache, swa_kv, swa_window_plan)
 
         compress_topk_idxs = None
         if self.compress_ratio > 1:
             assert compressor_attn_metadata.req_metadata is not None
             assert compressor_kv_state_metadata.req_metadata is not None
+            compressor_cp_metadata = compressor_attn_metadata.req_metadata.cp_metadata
+            compressor_slot_plan = (
+                compressor_cp_metadata.compressor_slot_plan
+                if has_prefill and compressor_cp_metadata.compressor_slot_plan is not None
+                else None
+            )
+            if compressor_slot_plan is not None:
+                compress_cos, compress_sin = get_cos_and_sin_dsa(
+                    {f"c{self.compress_ratio}": compressor_slot_plan.compressed_positions},
+                    use_cache=False,
+                )
+                compress_slot_mapping = compressor_slot_plan.slot_mapping
+            else:
+                compress_cos, compress_sin, compress_slot_mapping = self._compute_compressor_metadata(
+                    compressor_attn_metadata.req_metadata,
+                )
+
             if self.compress_ratio == 4:
                 self._update_indexer_cache(
-                    x=hidden_states_cache,
+                    hidden_states_local=hidden_states_local,
+                    hidden_halos=hidden_halos,
+                    hidden_states_full=_select_indexer_hidden_states_full(
+                        hidden_states,
+                        hidden_states_cache,
+                        use_local_cache_prefill,
+                    ),
+                    layer_name=layer_name,
                     kv_cache=kv_cache,
                     attn_metadata=attn_metadata,
+                    compressed_cos=compress_cos,
+                    compressed_sin=compress_sin,
                     actual_seq_lengths_query=actual_seq_lengths_query,
                 )
                 compress_topk_idxs = self._indexer_select_topk(
@@ -1396,33 +3036,85 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 )
 
             coff = 2 if self.compressor_overlap else 1
-            compress_cos, compress_sin, compress_slot_mapping = self._compute_compressor_metadata(
-                compressor_attn_metadata.req_metadata,
-            )
-            compressed_kv = torch.ops._C_ascend.compressor(
-                hidden_states_cache,
-                self.compressor_wkv.weight,
-                self.compressor_wgate.weight,
-                state_cache.squeeze(-2),
-                self.compressor_ape,
-                self.compressor_norm.weight,
-                compress_sin.view(-1, compress_sin.shape[-1]),
-                compress_cos.view(-1, compress_cos.shape[-1]),
-                state_block_table=compressor_kv_state_metadata.req_metadata.block_table,
-                cu_seqlens=actual_seq_lengths_query,
-                seqused=None,
-                start_pos=req_metadata.start_pos,
-                rope_head_dim=self.rope_head_dim,
-                cmp_ratio=self.compress_ratio,
-                coff=coff,
-                norm_eps=self.compressor_norm_eps,
-                rotary_mode=2,
-                cache_mode=1,
-            )
+            compressor_hidden_states = hidden_states_cache
+            compressor_cu_seqlens = actual_seq_lengths_query
+            compressor_start_pos = req_metadata.start_pos
+            compressor_state_block_table = compressor_kv_state_metadata.req_metadata.block_table
+            compressor_slot_mapping = compress_slot_mapping
+            compressor_sin = compress_sin
+            compressor_cos = compress_cos
+            compressor_state_broadcast_plan = compressor_kv_state_metadata.req_metadata.cp_metadata.state_broadcast_plan
+            run_compressor = True
+            if compressor_slot_plan is not None:
+                run_compressor = compressor_slot_plan.input_indices.numel() > 0
+                if run_compressor:
+                    request_indices = compressor_slot_plan.request_indices.to(device=req_metadata.start_pos.device)
+                    compressor_hidden_input_plan = compressor_cp_metadata.compressor_hidden_input_plan
+                    if compressor_hidden_input_plan is not None:
+                        compressor_hidden_states = self._assemble_dsa_cp_compressor_hidden_input(
+                            layer_name,
+                            compressor_slot_plan,
+                            compressor_hidden_input_plan,
+                            hidden_states_local,
+                            hidden_halos,
+                            hidden_states,
+                        )
+                    else:
+                        if hidden_states is None:
+                            raise RuntimeError("DSA CP compressor local-cache path requires a hidden input plan.")
+                        input_indices = compressor_slot_plan.input_indices.to(device=hidden_states.device)
+                        compressor_hidden_states = hidden_states[input_indices]
+                    compressor_cu_seqlens = compressor_slot_plan.input_query_start_loc.to(
+                        device=actual_seq_lengths_query.device
+                    )
+                    compressor_start_pos = req_metadata.start_pos.index_select(0, request_indices)
+                    compressor_start_pos = compressor_start_pos + compressor_slot_plan.start_pos_offsets.to(
+                        device=compressor_start_pos.device, dtype=compressor_start_pos.dtype
+                    )
+                    compressor_state_block_table = compressor_state_block_table.index_select(0, request_indices)
+
+            if run_compressor:
+                compressed_kv = torch.ops._C_ascend.compressor(
+                    compressor_hidden_states,
+                    self.compressor_wkv.weight,
+                    self.compressor_wgate.weight,
+                    state_cache.squeeze(-2),
+                    self.compressor_ape,
+                    self.compressor_norm.weight,
+                    compressor_sin.view(-1, compressor_sin.shape[-1]),
+                    compressor_cos.view(-1, compressor_cos.shape[-1]),
+                    state_block_table=compressor_state_block_table,
+                    cu_seqlens=compressor_cu_seqlens,
+                    seqused=None,
+                    start_pos=compressor_start_pos,
+                    rope_head_dim=self.rope_head_dim,
+                    cmp_ratio=self.compress_ratio,
+                    coff=coff,
+                    norm_eps=self.compressor_norm_eps,
+                    rotary_mode=2,
+                    cache_mode=1,
+                )
+            else:
+                compressed_kv = hidden_states_cache[:0]
 
             if compressed_kv.numel() == 0:
                 compressed_kv = None
-            DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
+            elif compressor_slot_plan is not None:
+                valid_output_mask = compressor_slot_plan.valid_output_mask.to(device=compressed_kv.device)
+                compressed_kv = compressed_kv[valid_output_mask]
+                compressor_slot_mapping = compressor_slot_plan.slot_mapping[valid_output_mask]
+                if compressed_kv.numel() == 0:
+                    compressed_kv = None
+
+            if compressed_kv is not None:
+                DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compressor_slot_mapping)
+
+            if compressor_slot_plan is not None:
+                self._all_gather_dsa_cp_compressed_cache_updates(
+                    compress_kv_cache, compressed_kv, compressor_slot_plan
+                )
+
+            self._broadcast_dsa_cp_state_blocks(state_cache, compressor_state_broadcast_plan)
 
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
@@ -1484,6 +3176,16 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 cmp_mask_mode=3,
                 **common_attn_kwargs,
             )[0]
+        if use_local_cache_prefill:
+            self._save_dsa_cp_hidden_tail_cache(
+                layer_name=layer_name,
+                hidden_states_local=hidden_states_local,
+                hidden_halos=hidden_halos,
+                req_metadata=req_metadata,
+                local_cache_plan=cp_metadata.local_cache_plan,
+                num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            )
+
         return attn_output, o_proj_full_handles
 
     def _restore_tp_head_layout(
@@ -1492,7 +3194,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
         layer_name: str,
         attn_metadata: M,
         skip_all_to_all: bool = False,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, int]:
         assert attn_metadata.req_metadata is not None
         req_metadata = attn_metadata.req_metadata
         cp_metadata = req_metadata.cp_metadata
@@ -1508,21 +3210,53 @@ class AscendDSACPImpl(DSAAttentionImpl):
         if self.tp_size == 1 or skip_all_to_all:
             return local_attn_output
 
+        local_cache_plan = cp_metadata.local_cache_plan
+        if local_cache_plan is None:
+            send = (
+                local_attn_output.view(num_tokens, self.tp_size, self.n_local_heads, self.head_dim)
+                .permute(1, 0, 2, 3)
+                .contiguous()
+                .view(-1, self.n_local_heads, self.head_dim)
+            )
+            recv = torch.empty_like(send)
+            dist.all_to_all_single(recv, send, group=self.tp_group.device_group)
+            return recv
+
+        all_rank_num_tokens = list(get_dsa_cp_all_rank_token_counts(local_cache_plan))
+        expected_num_tokens = all_rank_num_tokens[self.tp_rank]
+        if num_tokens != expected_num_tokens:
+            raise RuntimeError(
+                "DSA CP local-cache restore got unexpected local token count: "
+                f"rank={self.tp_rank}, expected={expected_num_tokens}, got={num_tokens}."
+            )
+        exchange_num_tokens = max(all_rank_num_tokens, default=0)
+        if exchange_num_tokens < num_tokens:
+            raise RuntimeError(
+                "DSA CP local-cache restore got invalid exchange token count: "
+                f"exchange={exchange_num_tokens}, local={num_tokens}."
+            )
+        if exchange_num_tokens > num_tokens:
+            local_attn_output = F.pad(local_attn_output, (0, 0, 0, 0, 0, exchange_num_tokens - num_tokens))
         send = (
-            local_attn_output.view(num_tokens, self.tp_size, self.n_local_heads, self.head_dim)
+            local_attn_output.view(exchange_num_tokens, self.tp_size, self.n_local_heads, self.head_dim)
             .permute(1, 0, 2, 3)
             .contiguous()
             .view(-1, self.n_local_heads, self.head_dim)
         )
         recv = torch.empty_like(send)
         dist.all_to_all_single(recv, send, group=self.tp_group.device_group)
-        return recv
+        return recv, exchange_num_tokens
 
     def _update_indexer_cache(
         self,
-        x: torch.Tensor,
+        hidden_states_local: torch.Tensor,
+        hidden_halos: tuple[list[torch.Tensor], list[tuple[int, int]]] | None,
+        hidden_states_full: torch.Tensor | None,
+        layer_name: str,
         kv_cache: tuple[torch.Tensor, ...],
         attn_metadata: list[M],
+        compressed_cos: torch.Tensor,
+        compressed_sin: torch.Tensor,
         actual_seq_lengths_query: torch.Tensor,
     ) -> None:
         (indexer_state_cache, indexer_k_cache, indexer_scale_cache, indexer_full_cache) = (
@@ -1535,47 +3269,111 @@ class AscendDSACPImpl(DSAAttentionImpl):
         assert indexer_kv_scale_metadata.req_metadata is not None
         assert indexer_kv_state_metadata.req_metadata is not None
         assert self.indexer is not None
-        compressed_cos, compressed_sin, indexer_slot_mapping = self._compute_compressor_metadata(
-            indexer_kv_scale_metadata.req_metadata,
-        )
-        kv = torch.ops._C_ascend.compressor(
-            x,
-            self.indexcom_wkv.weight,
-            self.indexcom_wgate.weight,
-            indexer_state_cache.squeeze(-2),
-            self.indexcom_ape,
-            self.indexcom_norm.weight,
-            compressed_sin.view(-1, compressed_sin.shape[-1]),
-            compressed_cos.view(-1, compressed_cos.shape[-1]),
-            state_block_table=indexer_kv_state_metadata.req_metadata.block_table,
-            cu_seqlens=actual_seq_lengths_query,
-            seqused=None,
-            start_pos=indexer_kv_scale_metadata.req_metadata.start_pos,
-            rope_head_dim=self.rope_head_dim,
-            cmp_ratio=self.compress_ratio,
-            coff=coff,
-            norm_eps=self.compressor_norm_eps,
-            rotary_mode=2,
-            cache_mode=1,
-        )
-
-        if kv.numel() == 0:
-            return
-        if self.indexer.compressor.rotate:
-            kv = rotate_activation(kv, indexer_kv_scale_metadata.hadamard)
-
-        _, kv_scale = DeviceOperator.indexer_quant_scatter_part1(
-            kv,
-            indexer_k_cache,
-            indexer_full_cache,
-            indexer_slot_mapping,
-        )
-        if kv_scale is not None:
-            DeviceOperator.dsa_indexer_scatter_scale_part3(
-                kv_scale,
-                indexer_scale_cache,
-                indexer_slot_mapping,
+        indexer_state_req_metadata = indexer_kv_state_metadata.req_metadata
+        indexer_scale_req_metadata = indexer_kv_scale_metadata.req_metadata
+        indexer_slot_plan = indexer_scale_req_metadata.cp_metadata.compressor_slot_plan
+        if indexer_slot_plan is None:
+            indexer_compressed_cos, indexer_compressed_sin, indexer_slot_mapping = self._compute_compressor_metadata(
+                indexer_scale_req_metadata,
             )
+        else:
+            indexer_compressed_cos = compressed_cos
+            indexer_compressed_sin = compressed_sin
+            indexer_slot_mapping = indexer_slot_plan.slot_mapping
+
+        indexer_state_block_table = indexer_state_req_metadata.block_table
+        indexer_cu_seqlens = actual_seq_lengths_query
+        indexer_start_pos = indexer_scale_req_metadata.start_pos
+        if hidden_states_full is None:
+            indexer_x = hidden_states_local
+        else:
+            indexer_x = hidden_states_full
+        state_broadcast_plan = indexer_state_req_metadata.cp_metadata.state_broadcast_plan
+        run_indexer_compressor = True
+
+        if indexer_slot_plan is not None:
+            run_indexer_compressor = indexer_slot_plan.input_indices.numel() > 0
+            if run_indexer_compressor:
+                request_indices = indexer_slot_plan.request_indices.to(device=indexer_start_pos.device)
+                indexer_hidden_input_plan = indexer_scale_req_metadata.cp_metadata.compressor_hidden_input_plan
+                if indexer_hidden_input_plan is not None:
+                    indexer_x = self._assemble_dsa_cp_compressor_hidden_input(
+                        layer_name,
+                        indexer_slot_plan,
+                        indexer_hidden_input_plan,
+                        hidden_states_local,
+                        hidden_halos,
+                        hidden_states_full,
+                    )
+                else:
+                    if hidden_states_full is None:
+                        raise RuntimeError("DSA CP indexer local-cache path requires a hidden input plan.")
+                    input_indices = indexer_slot_plan.input_indices.to(device=hidden_states_full.device)
+                    indexer_x = hidden_states_full[input_indices]
+                indexer_cu_seqlens = indexer_slot_plan.input_query_start_loc.to(device=actual_seq_lengths_query.device)
+                indexer_start_pos = indexer_start_pos.index_select(0, request_indices)
+                indexer_start_pos = indexer_start_pos + indexer_slot_plan.start_pos_offsets.to(
+                    device=indexer_start_pos.device, dtype=indexer_start_pos.dtype
+                )
+                indexer_state_block_table = indexer_state_block_table.index_select(0, request_indices)
+
+        kv = None
+        if run_indexer_compressor:
+            kv = torch.ops._C_ascend.compressor(
+                indexer_x,
+                self.indexcom_wkv.weight,
+                self.indexcom_wgate.weight,
+                indexer_state_cache.squeeze(-2),
+                self.indexcom_ape,
+                self.indexcom_norm.weight,
+                indexer_compressed_sin.view(-1, indexer_compressed_sin.shape[-1]),
+                indexer_compressed_cos.view(-1, indexer_compressed_cos.shape[-1]),
+                state_block_table=indexer_state_block_table,
+                cu_seqlens=indexer_cu_seqlens,
+                seqused=None,
+                start_pos=indexer_start_pos,
+                rope_head_dim=self.rope_head_dim,
+                cmp_ratio=self.compress_ratio,
+                coff=coff,
+                norm_eps=self.compressor_norm_eps,
+                rotary_mode=2,
+                cache_mode=1,
+            )
+
+        if kv is not None and kv.numel() > 0:
+            if indexer_slot_plan is not None:
+                valid_output_mask = indexer_slot_plan.valid_output_mask.to(device=kv.device)
+                kv = kv[valid_output_mask]
+                indexer_slot_mapping = indexer_slot_plan.slot_mapping[valid_output_mask]
+                if kv.numel() == 0:
+                    kv = None
+            if kv is not None:
+                if self.indexer.compressor.rotate:
+                    kv = rotate_activation(kv, indexer_kv_scale_metadata.hadamard)
+
+                _, kv_scale = DeviceOperator.indexer_quant_scatter_part1(
+                    kv,
+                    indexer_k_cache,
+                    indexer_full_cache,
+                    indexer_slot_mapping,
+                )
+                if kv_scale is not None:
+                    DeviceOperator.dsa_indexer_scatter_scale_part3(
+                        kv_scale,
+                        indexer_scale_cache,
+                        indexer_slot_mapping,
+                    )
+
+        if indexer_slot_plan is not None:
+            self._all_gather_dsa_cp_indexer_cache_updates(
+                indexer_k_cache,
+                indexer_scale_cache,
+                indexer_full_cache,
+                kv,
+                indexer_slot_plan,
+            )
+
+        self._broadcast_dsa_cp_state_blocks(indexer_state_cache, state_broadcast_plan)
 
     def _indexer_select_topk(
         self,

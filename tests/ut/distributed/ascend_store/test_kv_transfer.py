@@ -40,6 +40,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     KVCacheStoreSendingThread,
     KVTransferThread,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+    KVPoolWorker,
+)
 
 
 class FakeStore:
@@ -369,6 +372,135 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
         t._handle_request(req)
         keys, _, _ = store.put_calls[0]
         self.assertEqual(len(keys), 1)
+
+    def test_filter_dsa_cp_swa_owner_blocks_keeps_non_swa_groups(self):
+        t = KVCacheStoreSendingThread.__new__(KVCacheStoreSendingThread)
+        t.group_uses_swa = [False]
+        t.cp_rank = 1
+        t.cp_size = 2
+
+        starts, ends, keys, hashes = t._filter_dsa_cp_swa_owner_blocks(
+            starts=[0, 128, 256],
+            ends=[128, 256, 384],
+            keys=["k0", "k1", "k2"],
+            block_hashes=["h0", "h1", "h2"],
+            group_id=0,
+            token_len=384,
+        )
+
+        self.assertEqual(starts, [0, 128, 256])
+        self.assertEqual(ends, [128, 256, 384])
+        self.assertEqual(keys, ["k0", "k1", "k2"])
+        self.assertEqual(hashes, ["h0", "h1", "h2"])
+
+    def test_filter_dsa_cp_swa_owner_blocks_keeps_only_local_owner_blocks(self):
+        t = KVCacheStoreSendingThread.__new__(KVCacheStoreSendingThread)
+        t.group_uses_swa = [True]
+        t.cp_rank = 1
+        t.cp_size = 2
+
+        starts, ends, keys, hashes = t._filter_dsa_cp_swa_owner_blocks(
+            starts=[0, 128, 256],
+            ends=[128, 256, 384],
+            keys=["k0", "k1", "k2"],
+            block_hashes=["h0", "h1", "h2"],
+            group_id=0,
+            token_len=384,
+        )
+
+        self.assertEqual(starts, [256])
+        self.assertEqual(ends, [384])
+        self.assertEqual(keys, ["k2"])
+        self.assertEqual(hashes, ["h2"])
+
+    def test_filter_dsa_cp_swa_owner_blocks_skips_partial_owner_blocks(self):
+        t = KVCacheStoreSendingThread.__new__(KVCacheStoreSendingThread)
+        t.group_uses_swa = [True]
+        t.cp_rank = 1
+        t.cp_size = 2
+
+        starts, ends, keys, hashes = t._filter_dsa_cp_swa_owner_blocks(
+            starts=[192],
+            ends=[320],
+            keys=["k_partial"],
+            block_hashes=["h_partial"],
+            group_id=0,
+            token_len=384,
+        )
+
+        self.assertEqual(starts, [])
+        self.assertEqual(ends, [])
+        self.assertEqual(keys, [])
+        self.assertEqual(hashes, [])
+
+    def test_filter_dsa_cp_swa_owner_blocks_uses_explicit_batch_owner_ranges(self):
+        t = KVCacheStoreSendingThread.__new__(KVCacheStoreSendingThread)
+        t.group_uses_swa = [True]
+        t.cp_rank = 1
+        t.cp_size = 2
+
+        starts, ends, keys, hashes = t._filter_dsa_cp_swa_owner_blocks(
+            starts=[0, 128, 256],
+            ends=[128, 256, 384],
+            keys=["k0", "k1", "k2"],
+            block_hashes=["h0", "h1", "h2"],
+            group_id=0,
+            token_len=384,
+            owner_ranges=[(0, 128)],
+        )
+
+        self.assertEqual(starts, [0])
+        self.assertEqual(ends, [128])
+        self.assertEqual(keys, ["k0"])
+        self.assertEqual(hashes, ["h0"])
+
+    def test_handle_request_filters_block_ids_with_dsa_cp_swa_owner_blocks(self):
+        store = FakeStore([0])
+        db = FakeTokenDatabase(block_size=128)
+        t = KVCacheStoreSendingThread(
+            m_store=store,
+            token_database=db,
+            block_size=128,
+            tp_rank=0,
+            dcp_size=1,
+            put_step=1,
+            kv_role="kv_producer",
+            ready_event=threading.Event(),
+            group_uses_align_state=[False],
+            group_uses_swa=[True],
+            cp_rank=1,
+            cp_size=2,
+        )
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=384,
+            block_ids=[0, 1, 2],
+            block_hashes=[b"h0", b"h1", b"h2"],  # type: ignore[arg-type]
+            current_event=None,
+        )
+
+        t.add_stored_request("r1")
+        t.request_queue.put(req)
+        t._handle_request(req)
+
+        keys, addrs, _ = store.put_calls[0]
+        self.assertEqual(keys, ["k2"])
+        self.assertEqual(addrs, [[1002]])
+
+    def test_pool_worker_assigns_dsa_cp_swa_owner_ranges_after_flatten_padding(self):
+        worker = KVPoolWorker.__new__(KVPoolWorker)
+        worker.pcp_size = 4
+        worker.dcp_size = 1
+        worker.pcp_rank = 3
+        worker.dcp_rank = 0
+        worker.group_uses_swa = [True]
+        req0 = ReqMeta(req_id="r0", token_len_chunk=320, can_save=True)
+        req1 = ReqMeta(req_id="r1", token_len_chunk=96, can_save=True)
+
+        worker._assign_dsa_cp_swa_owner_ranges_for_save_batch([req0, req1])
+
+        self.assertEqual(req0.dsa_cp_swa_owner_ranges, [])
+        self.assertEqual(req1.dsa_cp_swa_owner_ranges, [(0, 96)])
 
 
 class TestKVCacheStoreRecvingThread(unittest.TestCase):

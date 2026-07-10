@@ -1,9 +1,14 @@
+from __future__ import annotations
+
+import ctypes
+import math
 import queue
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import numpy as np
 import torch
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
@@ -14,11 +19,211 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend im
 # isort: off
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     ChunkedTokenDatabase,
+    LayerBatchReqMeta,
+    LayerBlockRange,
+    LayerLoadTask,
     LayerMultiBlockReqMeta,
+    LayerTransferTask,
     ReqMeta,
+    SharedBlockData,
     get_block_hashes,
 )
 # isort: on
+
+
+DSA_CP_PREFIX_CACHE_UNIT_SIZE = 128
+
+
+def _circular_shift(lst: list, offset: int) -> list:
+    if not lst or offset == 0:
+        return lst
+    return lst[offset:] + lst[:offset]
+
+
+def _circular_shift_array(value: np.ndarray, offset: int) -> np.ndarray:
+    length = len(value)
+    if length == 0:
+        return value
+    offset %= length
+    if offset == 0:
+        return value
+    return np.concatenate((value[offset:], value[:offset]))
+
+
+class LayerBatchBuilder:
+    def __init__(
+        self,
+        token_database: ChunkedTokenDatabase,
+        my_key_index: int,
+        num_ranks_per_layer: int,
+        page_size_bytes: int,
+        num_layers: int,
+    ) -> None:
+        self.my_key_index = my_key_index
+        self.num_ranks_per_layer = num_ranks_per_layer
+        self.page_size_bytes = page_size_bytes
+        self.num_layers = num_layers
+        self._block_len_np = np.asarray(token_database.group_block_len[0], dtype=np.int64)
+        self._kv_caches_base_addr_np = np.asarray(
+            token_database.group_kv_caches_base_addr[0],
+            dtype=np.int64,
+        )
+        group_block_stride = token_database.group_block_stride.get(0, token_database.group_block_len[0])
+        self._block_stride_np = np.asarray(group_block_stride, dtype=np.int64)
+        # group_block_len[0] / kv_caches_base_addr[0] are laid out flat as
+        # [layer0_caches..., layer1_caches..., ...]; the per-layer stride is the
+        # total length divided by the number of layers (mirrors
+        # ChunkedTokenDatabase caches_per_layer computation).
+        self._caches_per_layer = max(1, self._block_len_np.shape[0] // max(1, num_layers))
+        self._block_ids_buf: np.ndarray | None = None
+        self._block_gvas_buf: np.ndarray | None = None
+
+    def _ensure_buf(self, capacity: int) -> tuple[np.ndarray, np.ndarray]:
+        if self._block_ids_buf is None or len(self._block_ids_buf) < capacity:
+            self._block_ids_buf = np.empty(capacity, dtype=np.int64)
+            self._block_gvas_buf = np.empty(capacity, dtype=np.int64)
+        assert self._block_ids_buf is not None and self._block_gvas_buf is not None
+        return self._block_ids_buf[:capacity], self._block_gvas_buf[:capacity]
+
+    @staticmethod
+    def _dedupe_transfer_blocks(
+        block_ids_arr: np.ndarray,
+        block_gvas_arr: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if block_ids_arr.size <= 1:
+            return block_ids_arr, block_gvas_arr
+
+        block_transfer_array = np.column_stack((block_ids_arr, block_gvas_arr))
+        _, unique_indices = np.unique(
+            block_transfer_array,
+            axis=0,
+            return_index=True,
+        )
+        if unique_indices.size == block_ids_arr.size:
+            return block_ids_arr, block_gvas_arr
+
+        return (
+            block_ids_arr[unique_indices],
+            block_gvas_arr[unique_indices],
+        )
+
+    def _build_transfer_arrays(
+        self,
+        block_ids_arr: np.ndarray,
+        base_gvas_arr: np.ndarray,
+        layer_id: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        caches_per_layer = self._caches_per_layer
+        # group_* arrays are laid out flat as [layer0_caches..., layer1_caches...];
+        # slice the per-layer window for ``layer_id``. Using the full length as the
+        # stride (the old behaviour) overshoots for layer_id >= 1 and yields empty
+        # slices -> broadcast errors.
+        base_offset = layer_id * caches_per_layer
+        layer_base_addrs = self._kv_caches_base_addr_np[base_offset : base_offset + caches_per_layer]
+        layer_block_len = self._block_len_np[base_offset : base_offset + caches_per_layer]
+        layer_block_stride = self._block_stride_np[base_offset : base_offset + caches_per_layer]
+        # Per-cache inner offsets within one layer's page: [0, len0, len0+len1, ...].
+        layer_inner_offsets = np.concatenate(
+            (np.zeros(1, dtype=np.int64), np.cumsum(layer_block_len[:-1], dtype=np.int64))
+        )
+        rank_layer_offset = (layer_id * self.num_ranks_per_layer + self.my_key_index) * self.page_size_bytes
+
+        addr_arr = layer_base_addrs[None, :] + block_ids_arr[:, None] * layer_block_stride[None, :]
+        size_arr = np.broadcast_to(layer_block_len, addr_arr.shape)
+        gvas_arr = base_gvas_arr[:, None] + rank_layer_offset + layer_inner_offsets[None, :]
+
+        return (
+            addr_arr.ravel(),
+            size_arr.ravel(),
+            gvas_arr.ravel(),
+        )
+
+    @staticmethod
+    def _require_request_arrays(
+        block_range: LayerBlockRange,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        request = block_range.request
+        if request.block_ids_np is None or request.block_gvas_np is None:
+            raise RuntimeError("ReqMeta numpy block metadata is not initialized")
+        return request.block_ids_np, request.block_gvas_np
+
+    def build_shared(self, task: LayerTransferTask) -> SharedBlockData | None:
+        """Pre-compute shared block data that is identical across all layers."""
+        if not task.block_ranges:
+            return None
+
+        total = 0
+        for block_range in task.block_ranges:
+            total += block_range.end_block - block_range.start_block
+            if block_range.partial_block_index is not None:
+                total += 1
+
+        block_ids_arr, block_gvas_arr = self._ensure_buf(total)
+        req_ids: list[str] = []
+        is_last_chunks: list[bool | None] = []
+        offset = 0
+
+        for block_range in task.block_ranges:
+            request = block_range.request
+            req_ids.append(request.req_id)
+            is_last_chunks.append(request.is_last_chunk)
+            block_ids_np, block_gvas_np = self._require_request_arrays(block_range)
+
+            num_blocks = block_range.end_block - block_range.start_block
+            if num_blocks > 0:
+                gva_start = block_range.start_block - request.gva_block_offset
+                gva_end = block_range.end_block - request.gva_block_offset
+                if gva_start < 0 or gva_end > len(block_gvas_np):
+                    raise RuntimeError(
+                        "ReqMeta GVA metadata does not cover requested block "
+                        f"range [{block_range.start_block}, {block_range.end_block}) "
+                        f"with offset {request.gva_block_offset}"
+                    )
+                end = offset + num_blocks
+                block_ids_arr[offset:end] = block_ids_np[block_range.start_block : block_range.end_block]
+                block_gvas_arr[offset:end] = block_gvas_np[gva_start:gva_end]
+                offset = end
+
+            if block_range.partial_block_index is not None:
+                assert request.last_block_gva is not None
+                block_ids_arr[offset] = block_ids_np[block_range.partial_block_index]
+                block_gvas_arr[offset] = request.last_block_gva
+                offset += 1
+
+        block_ids_arr, block_gvas_arr = self._dedupe_transfer_blocks(block_ids_arr[:offset], block_gvas_arr[:offset])
+
+        return SharedBlockData(
+            block_ids_arr=block_ids_arr,
+            block_gvas_arr=block_gvas_arr,
+            req_ids=req_ids,
+            is_last_chunks=is_last_chunks,
+        )
+
+    def build_addrs(
+        self,
+        shared: SharedBlockData,
+        layer_id: int,
+    ) -> LayerBatchReqMeta:
+        """Compute per-layer addresses from pre-computed shared block data."""
+        addr_array, size_array, gvas_array = self._build_transfer_arrays(
+            shared.block_ids_arr, shared.block_gvas_arr, layer_id
+        )
+
+        return LayerBatchReqMeta(
+            req_ids=shared.req_ids,
+            layer_id=layer_id,
+            is_last_chunks=shared.is_last_chunks,
+            addr_array=addr_array,
+            size_array=size_array,
+            gvas_array=gvas_array,
+        )
+
+    def build(self, task: LayerTransferTask) -> LayerBatchReqMeta | None:
+        """Full build: shared data + per-layer addresses (backward compat)."""
+        shared = self.build_shared(task)
+        if shared is None:
+            return None
+        return self.build_addrs(shared, task.layer_id)
 
 
 class KVTransferThread(threading.Thread):
@@ -257,6 +462,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
         ready_event: threading.Event,
         group_uses_align_state: list[bool],
         enable_kv_event: bool = False,
+        group_uses_swa: list[bool] | None = None,
+        cp_rank: int = 0,
+        cp_size: int = 1,
     ):
         super().__init__(
             m_store, token_database, block_size, tp_rank, dcp_size, ready_event, name="KVCacheSendingThread"
@@ -264,7 +472,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.put_step = put_step
         self.kv_role = kv_role
         self.stored_requests = defaultdict[str, int](int)
-        self.group_uses_align_state = group_uses_align_state
+        self.group_uses_align_state = group_uses_align_state or []
+        self.group_uses_swa = group_uses_swa or []
+        self.cp_rank = cp_rank
+        self.cp_size = cp_size
         self.enable_kv_event = enable_kv_event
         self.completed_events_lock = threading.Lock()
         self.completed_events: dict[int, int] = {}
@@ -295,6 +506,58 @@ class KVCacheStoreSendingThread(KVTransferThread):
             completed_events = self.completed_events.copy()
             self.completed_events.clear()
         return completed_events
+
+    @staticmethod
+    def _get_dsa_cp_owner_range(
+        token_len: int, cp_size: int, cp_rank: int, unit_size: int = DSA_CP_PREFIX_CACHE_UNIT_SIZE
+    ) -> tuple[int, int]:
+        num_units = math.ceil(token_len / unit_size)
+        base_units = num_units // cp_size
+        remainder_units = num_units % cp_size
+        local_units = base_units + int(cp_rank < remainder_units)
+        local_start_units = cp_rank * base_units + min(cp_rank, remainder_units)
+        local_start = local_start_units * unit_size
+        return min(local_start, token_len), min(local_start + local_units * unit_size, token_len)
+
+    def _filter_dsa_cp_swa_owner_blocks(
+        self,
+        starts: list[int],
+        ends: list[int],
+        keys: list[str],
+        block_hashes: list,
+        group_id: int,
+        token_len: int,
+        owner_ranges: list[tuple[int, int]] | None = None,
+    ) -> tuple[list[int], list[int], list[str], list]:
+        if group_id >= len(self.group_uses_swa) or not self.group_uses_swa[group_id]:
+            return starts, ends, keys, block_hashes
+        if self.cp_size <= 1:
+            return starts, ends, keys, block_hashes
+
+        if owner_ranges is None:
+            owner_ranges = [self._get_dsa_cp_owner_range(token_len, self.cp_size, self.cp_rank)]
+        owner_ranges = [(start, end) for start, end in owner_ranges if start < end]
+        filtered_starts: list[int] = []
+        filtered_ends: list[int] = []
+        filtered_keys: list[str] = []
+        filtered_hashes: list = []
+        skipped_partial = 0
+        for start, end, key, block_hash in zip(starts, ends, keys, block_hashes):
+            if any(owner_start <= start and end <= owner_end for owner_start, owner_end in owner_ranges):
+                filtered_starts.append(start)
+                filtered_ends.append(end)
+                filtered_keys.append(key)
+                filtered_hashes.append(block_hash)
+            elif any(start < owner_end and end > owner_start for owner_start, owner_end in owner_ranges):
+                skipped_partial += 1
+        if skipped_partial:
+            logger.warning(
+                "Skip %d partial DSA CP SWA prefix-cache blocks for group %d; "
+                "expected put chunks to be owner-range aligned.",
+                skipped_partial,
+                group_id,
+            )
+        return filtered_starts, filtered_ends, filtered_keys, filtered_hashes
 
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.token_len_chunk
@@ -334,6 +597,18 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     keys.append(key.to_string())
                     block_hashes.append(group_block_hashes[start // group_block_size])
                     key_block_ids.append(block_id)
+
+                block_ids_by_start = dict(zip(starts, key_block_ids))
+                starts, ends, keys, block_hashes = self._filter_dsa_cp_swa_owner_blocks(
+                    starts,
+                    ends,
+                    keys,
+                    block_hashes,
+                    group_id,
+                    token_len,
+                    getattr(req_meta, "dsa_cp_swa_owner_ranges", None),
+                )
+                key_block_ids = [block_ids_by_start[start] for start in starts]
 
                 if (
                     not self.dcp_size > 1

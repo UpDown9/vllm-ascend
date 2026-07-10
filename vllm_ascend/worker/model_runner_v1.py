@@ -2335,8 +2335,36 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
+
+            intermediate_tensor_shapes = (
+                {name: tuple(tensor.shape) for name, tensor in intermediate_tensors.tensors.items()}
+                if intermediate_tensors is not None
+                else None
+            )
+            torch.npu.current_stream().synchronize()
+            forward_start_timestamp_ns = time.time_ns()
+            forward_start_time = time.perf_counter()
+            logger.info(
+                "Model forward start: timestamp_ns=%d, num_tokens_padded=%d, "
+                "input_ids_shape=%s, positions_shape=%s, inputs_embeds_shape=%s, "
+                "intermediate_tensor_shapes=%s",
+                forward_start_timestamp_ns,
+                num_tokens_padded,
+                tuple(input_ids.shape) if input_ids is not None else None,
+                tuple(positions.shape) if positions is not None else None,
+                tuple(inputs_embeds.shape) if inputs_embeds is not None else None,
+                intermediate_tensor_shapes,
+            )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+            )
+            torch.npu.current_stream().synchronize()
+            forward_end_time = time.perf_counter()
+            forward_end_timestamp_ns = time.time_ns()
+            logger.info(
+                "Model forward end: timestamp_ns=%d, elapsed_ms=%.3f",
+                forward_end_timestamp_ns,
+                (forward_end_time - forward_start_time) * 1000,
             )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -3200,6 +3228,7 @@ class NPUModelRunner(GPUModelRunner):
             positions=self.positions,
             positions_cpu=self._dsa_positions_cpu_buf if self.use_compress else None,
             attn_state=self.attn_state,
+            request_ids=list(self.input_batch.req_ids[:num_reqs_padded]),
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
         )

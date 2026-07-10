@@ -29,6 +29,7 @@ from collections.abc import Callable, Iterable
 from itertools import islice
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import torch_npu
 from torch import nn
@@ -41,6 +42,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
@@ -103,6 +105,60 @@ def _dsv4_block_sizes():
     from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
 
     return DSV4_BLOCK_SIZES
+
+
+def _get_dsa_cp_local_cache_plan():
+    from vllm_ascend.ascend_forward_context import get_forward_context
+
+    forward_ctx = get_forward_context()
+    if forward_ctx is None:
+        return None
+    attn_metadata = getattr(forward_ctx, "attn_metadata", None)
+    if not attn_metadata:
+        return None
+    metadata_values = attn_metadata.values() if isinstance(attn_metadata, dict) else attn_metadata
+    for metadata in metadata_values:
+        req_metadata = getattr(metadata, "req_metadata", None)
+        cp_metadata = getattr(req_metadata, "cp_metadata", None)
+        local_cache_plan = getattr(cp_metadata, "local_cache_plan", None)
+        if local_cache_plan is not None:
+            return local_cache_plan
+    return None
+
+
+def _select_dsa_cp_local_hidden(hidden_states: torch.Tensor, local_cache_plan) -> torch.Tensor:
+    if local_cache_plan is None or hidden_states.shape[0] == local_cache_plan.local_num_tokens:
+        return hidden_states
+    if hidden_states.shape[0] < local_cache_plan.local_end:
+        return hidden_states
+    if not local_cache_plan.local_valid_ranges:
+        return hidden_states[:0]
+    if len(local_cache_plan.local_valid_ranges) == 1:
+        start, end = local_cache_plan.local_valid_ranges[0]
+        return hidden_states[start:end]
+    return torch.cat([hidden_states[start:end] for start, end in local_cache_plan.local_valid_ranges], dim=0)
+
+
+def _gather_dsa_cp_local_hidden(hidden_states: torch.Tensor, local_cache_plan) -> torch.Tensor:
+    if local_cache_plan is None or local_cache_plan.cp_size <= 1:
+        return hidden_states
+    if hidden_states.shape[0] != local_cache_plan.local_num_tokens:
+        return hidden_states
+    exchange_num_tokens = max(local_cache_plan.all_rank_num_tokens, default=0)
+    if exchange_num_tokens == 0:
+        return hidden_states[:0]
+    if hidden_states.shape[0] < exchange_num_tokens:
+        pad_shape = (exchange_num_tokens - hidden_states.shape[0], *hidden_states.shape[1:])
+        hidden_states = torch.cat(
+            [hidden_states, torch.zeros(pad_shape, dtype=hidden_states.dtype, device=hidden_states.device)],
+            dim=0,
+        )
+    gathered = [torch.empty_like(hidden_states) for _ in range(local_cache_plan.cp_size)]
+    dist.all_gather(gathered, hidden_states, group=get_tp_group().device_group)
+    return torch.cat(
+        [rank_hidden[:num_tokens] for rank_hidden, num_tokens in zip(gathered, local_cache_plan.all_rank_num_tokens)],
+        dim=0,
+    )
 
 
 class AscendCompressorStateCache(CompressorStateCache):
@@ -986,6 +1042,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        hidden_states = _select_dsa_cp_local_hidden(hidden_states, _get_dsa_cp_local_cache_plan())
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         hidden_states = self.input_layernorm(hidden_states)
@@ -1134,16 +1191,18 @@ class DeepseekV4Model(nn.Module):
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
-        # When FlashComm1 (sequence parallelism) is enabled, tokens are
-        # partitioned across TP ranks via reduce_scatter in each layer's
-        # row-parallel output projection.  We must all_gather here so the
-        # MTP layers receive the full token set — otherwise only rank 0's
-        # partition is valid and the rest of the buffer holds stale data,
-        # leading to NaN values and low acceptance rate.
+        # Local-cache CP keeps layer outputs sharded by token; gather once here
+        # so the MTP layers and final lm head consume the same full-token view
+        # as the legacy CP path.
         from vllm_ascend.ascend_forward_context import get_forward_context
 
         forward_ctx = get_forward_context()
-        if forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
+        local_cache_plan = _get_dsa_cp_local_cache_plan()
+        if local_cache_plan is not None and hidden_states.shape[0] == local_cache_plan.local_num_tokens:
+            hidden_states = _gather_dsa_cp_local_hidden(hidden_states, local_cache_plan)
+            num_tokens = hidden_states.shape[0]
+            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+        elif forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
             h_states_flat = tensor_model_parallel_all_gather(hidden_states.flatten(1), dim=0)
             pad_size = forward_ctx.pad_size
             if pad_size > 0:

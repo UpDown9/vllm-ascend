@@ -59,6 +59,23 @@ class RopeDataProxy:
             return layer_result
 
 
+def concatenate_rope_slices(
+    rope_data: RopeDataProxy,
+    ranges: tuple[tuple[int, int], ...],
+) -> tuple[RopeDataProxy, RopeDataProxy]:
+    """Concatenate token ranges while preserving deferred per-layer RoPE lookup."""
+    concatenated_data: dict[Any, Any] = {}
+    for config_key, groups_map in rope_data._data.items():
+        concatenated_data[config_key] = {}
+        for group_name, (cos, sin) in groups_map.items():
+            concatenated_data[config_key][group_name] = (
+                torch.cat([cos[start:end] for start, end in ranges], dim=0),
+                torch.cat([sin[start:end] for start, end in ranges], dim=0),
+            )
+
+    return RopeDataProxy(concatenated_data, is_cos=True), RopeDataProxy(concatenated_data, is_cos=False)
+
+
 def get_cos_and_sin_dsa(
     positions: torch.Tensor | dict[str, torch.Tensor],
     use_cache: bool = False,

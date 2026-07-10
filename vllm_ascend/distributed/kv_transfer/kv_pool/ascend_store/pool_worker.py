@@ -39,6 +39,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import
     ExternalCachedBlockPool,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+    DSA_CP_PREFIX_CACHE_UNIT_SIZE,
     KVCacheStoreLayerRecvingThread,
     KVCacheStoreLayerSendingThread,
     KVCacheStoreRecvingThread,
@@ -129,6 +130,7 @@ class KVPoolWorker:
         self.num_kv_cache_groups = len(self.grouped_block_size)
         self.kv_cache_group_families = self._infer_group_families()
         self.group_uses_align_state = self._infer_group_uses_align_state()
+        self.group_uses_swa = self._infer_group_uses_swa()
         self.cache_transfer_granularity = self._infer_cache_transfer_granularity()
         if self.use_layerwise and self.num_kv_cache_groups > 1:
             raise NotImplementedError("AscendStore layerwise mode does not yet support hybrid KV cache groups.")
@@ -229,6 +231,47 @@ class KVPoolWorker:
 
         self.finished_store_req: set[str] = set()
 
+    @staticmethod
+    def _ceil_to_dsa_cp_unit(num_tokens: int) -> int:
+        if num_tokens <= 0:
+            return 0
+        return (
+            (num_tokens + DSA_CP_PREFIX_CACHE_UNIT_SIZE - 1)
+            // DSA_CP_PREFIX_CACHE_UNIT_SIZE
+            * DSA_CP_PREFIX_CACHE_UNIT_SIZE
+        )
+
+    def _assign_dsa_cp_swa_owner_ranges_for_save_batch(self, requests: list[ReqMeta]) -> None:
+        if self.pcp_size * self.dcp_size <= 1 or not any(self.group_uses_swa):
+            return
+
+        save_requests = [request for request in requests if request.can_save is not None and request.can_save]
+        if not save_requests:
+            return
+
+        cp_size = self.pcp_size * self.dcp_size
+        cp_rank = self.pcp_rank * self.dcp_size + self.dcp_rank
+        request_spans: list[tuple[ReqMeta, int, int, int]] = []
+        padded_total = 0
+        for request in save_requests:
+            token_len = request.token_len_chunk
+            padded_len = self._ceil_to_dsa_cp_unit(token_len)
+            request_spans.append((request, token_len, padded_total, padded_total + padded_len))
+            padded_total += padded_len
+
+        owner_start, owner_end = KVCacheStoreSendingThread._get_dsa_cp_owner_range(
+            padded_total, cp_size, cp_rank
+        )
+        for request, token_len, padded_start, padded_end in request_spans:
+            start = max(owner_start, padded_start)
+            end = min(owner_end, padded_end)
+            if start >= end:
+                request.dsa_cp_swa_owner_ranges = []
+                continue
+            real_start = min(start - padded_start, token_len)
+            real_end = min(end - padded_start, token_len)
+            request.dsa_cp_swa_owner_ranges = [(real_start, real_end)] if real_start < real_end else []
+
     def _build_cache_coordinator(self, vllm_config: VllmConfig) -> AscendStoreCoordinator | None:
         if self.kv_cache_config is None or not self.use_hybrid:
             return None
@@ -285,6 +328,26 @@ class KVPoolWorker:
                 )
             )
         return group_uses_align_state
+
+    def _infer_group_uses_swa(self) -> list[bool]:
+        if self.kv_cache_config is None:
+            return [False]
+
+        group_uses_swa: list[bool] = []
+        for group in self.kv_cache_config.kv_cache_groups:
+            kv_cache_spec = group.kv_cache_spec
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                specs = [kv_cache_spec.kv_cache_specs[layer_name] for layer_name in group.layer_names]
+            else:
+                specs = [kv_cache_spec]
+            group_uses_swa.append(
+                any(
+                    spec.__class__.__name__ == "SlidingWindowSpec"
+                    or getattr(spec, "sliding_window", None) is not None
+                    for spec in specs
+                )
+            )
+        return group_uses_swa
 
     def _get_group_block_size(self, group_id: int) -> int:
         if group_id >= len(self.grouped_block_size):
@@ -502,6 +565,9 @@ class KVPoolWorker:
                     ready_event_sending,
                     self.group_uses_align_state,
                     self.enable_kv_events,
+                    self.group_uses_swa,
+                    self.pcp_rank * self.dcp_size + self.dcp_rank,
+                    self.pcp_size * self.dcp_size,
                 )
                 self.kv_send_thread.start()
             if self.load_async:
@@ -710,6 +776,8 @@ class KVPoolWorker:
             current_event = torch.npu.Event()
             current_event.record()
             break
+
+        self._assign_dsa_cp_swa_owner_ranges_for_save_batch(connector_metadata.requests)
 
         for request in connector_metadata.requests:
             can_save = request.can_save
