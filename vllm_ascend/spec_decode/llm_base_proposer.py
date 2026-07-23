@@ -208,6 +208,21 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
         self.decode_threshold = 1 + self.num_speculative_tokens
         self.query_start_loc = self.runner._make_buffer(self.runner.max_num_reqs + 2, dtype=torch.int32)
+        # ``prepare_next_token_ids_padded`` runs after the target sampler and
+        # is outside the model runner's input-preparation synchronization
+        # scope. Its CPU half is pinned memory, so copy_to_gpu() can still be
+        # reading it asynchronously when the next scheduler step starts.
+        # Keep two staging slots and gate reuse of each slot on its own event
+        # to prevent the CPU producer from overwriting an in-flight H2D source.
+        self._backup_next_token_ids_buffers = [
+            self.backup_next_token_ids,
+            self.runner._make_buffer(self.runner.max_num_reqs, dtype=torch.int32),
+        ]
+        self._backup_next_token_ids_events: list[torch.npu.Event | None] = [
+            None,
+            None,
+        ]
+        self._backup_next_token_ids_buffer_index = 0
         self.arange_cpu = torch.arange(self.arange.shape[0], device="cpu", dtype=torch.int32)
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
 
@@ -1986,18 +2001,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         for each request, considering the "discarded" requests whose next token
         is not sampled and comes from `request.get_token_id()` instead.
         It also accounts for the rejected tokens in `sampled_token_ids`.
-        This function must use device functions to operate on the inputs, and
-        should not introduce any blocking CPU-GPU synchronization.
+        This function must use device functions to operate on the inputs and
+        must not synchronize the whole device. Reusing a pinned staging slot
+        may wait for only that slot's preceding H2D operation to finish.
         """
         # TODO(Ben): Combine this into a custom fused kernel
 
         # Precompute get_token_id for when there is no valid next token
         num_reqs = gpu_input_batch.num_reqs
         seq_lens_list = (gpu_input_batch.num_tokens_no_spec[:num_reqs] - 1).tolist()
-        self.backup_next_token_ids.np[:num_reqs] = np.array(
+        buffer_index = self._backup_next_token_ids_buffer_index
+        backup_next_token_ids = self._backup_next_token_ids_buffers[buffer_index]
+        buffer_ready_event = self._backup_next_token_ids_events[buffer_index]
+        if buffer_ready_event is not None:
+            buffer_ready_event.synchronize()
+
+        backup_next_token_ids.np[:num_reqs] = np.array(
             [requests[gpu_input_batch.req_ids[i]].get_token_id(seq_lens_list[i]) for i in range(num_reqs)]
         )
-        self.backup_next_token_ids.copy_to_gpu(num_reqs)
+        backup_next_token_ids.copy_to_gpu(num_reqs)
 
         # Mask out the sampled tokens indices that should not be sampled.
         discard_sampled_tokens_req_indices = discard_request_indices[:num_discarded_requests]
@@ -2029,8 +2051,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         next_token_ids = torch.where(
             last_valid_indices != -1,
             selected_tokens,
-            self.backup_next_token_ids.gpu[:batch_size],
+            backup_next_token_ids.gpu[:batch_size],
         )
+
+        if buffer_ready_event is None:
+            buffer_ready_event = torch.npu.Event()
+            self._backup_next_token_ids_events[buffer_index] = buffer_ready_event
+        buffer_ready_event.record()
+        self._backup_next_token_ids_buffer_index = (
+            buffer_index + 1
+        ) % len(self._backup_next_token_ids_buffers)
 
         return next_token_ids, valid_sampled_tokens_count
 

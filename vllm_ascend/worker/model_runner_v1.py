@@ -157,7 +157,6 @@ from vllm_ascend.utils import (
     enable_sp_by_pass,
     get_ascend_device_type,
     get_c_env,
-    global_stream,
     is_hidden_state_cache_spec,
     kv_cache_spec_uses_sparse_c8,
     lmhead_tp_enable,
@@ -2549,13 +2548,18 @@ class NPUModelRunner(GPUModelRunner):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         if self.need_accepted_tokens:
-            if self.sampling_done_event is None:
-                self.sampling_done_event = torch.npu.Event()
+            self._update_states_after_model_execute(
+                sampler_output.sampled_token_ids,
+                scheduler_output,
+            )
 
-            assert self.sampling_done_event is not None
-            self.sampling_done_event.record()
-
+        # The previous-step speculative tensors have already been consumed by
+        # _prepare_inputs(). Clear them before producing this step's drafts so
+        # batch changes cannot accidentally reuse stale device tensors.
+        self._draft_token_ids = None
+        self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None # type: ignore[no-redef]
+        self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -2637,15 +2641,6 @@ class NPUModelRunner(GPUModelRunner):
             self.eplb_updator.forward_end(self.eplb_heat_collection_status)
 
         self._finalize_dump_data()
-
-        if self.need_accepted_tokens:
-            assert self.sampling_done_event is not None
-            with (
-                record_function_or_nullcontext("async_state_update"),
-                torch.npu.stream(global_stream()),
-            ):
-                global_stream().wait_event(self.sampling_done_event)
-                self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
         # In async scheduling + PP, broadcast sampled token ids from the
         # last PP rank so other PP ranks can receive them without going
