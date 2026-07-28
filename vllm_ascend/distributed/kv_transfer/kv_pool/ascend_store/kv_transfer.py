@@ -16,6 +16,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     ChunkedTokenDatabase,
     LayerMultiBlockReqMeta,
     ReqMeta,
+    TransferChunkWithBlockId,
     get_block_hashes,
 )
 # isort: on
@@ -197,6 +198,79 @@ class KVTransferThread(threading.Thread):
         except TypeError:
             return self.token_database.prepare_value(start, end, block_ids)
 
+    def _process_transfer_chunks_with_block_ids(
+        self,
+        token_len: int,
+        block_hashes,
+        block_ids: list[int],
+        mask_num: int = 0,
+        kv_cache_group_id: int = 0,
+        skip_null_blocks: bool = False,
+        cache_role: str = "kv",
+    ):
+        process_transfer_chunks = getattr(
+            self.token_database,
+            "process_transfer_chunks_with_block_ids",
+            None,
+        )
+        if process_transfer_chunks is not None:
+            return process_transfer_chunks(
+                token_len,
+                block_hashes,
+                block_ids,
+                mask_num,
+                kv_cache_group_id=kv_cache_group_id,
+                skip_null_blocks=skip_null_blocks,
+                cache_role=cache_role,
+            )
+
+        def iter_legacy_chunks():
+            group_block_size = self._get_block_size(kv_cache_group_id)
+            for start, end, key, block_id in self._process_tokens_with_block_ids(
+                token_len,
+                block_hashes,
+                block_ids,
+                mask_num,
+                kv_cache_group_id=kv_cache_group_id,
+                skip_null_blocks=skip_null_blocks,
+                cache_role=cache_role,
+            ):
+                yield TransferChunkWithBlockId(
+                    raw_start=start,
+                    raw_end=end,
+                    value_start=start,
+                    value_end=end,
+                    target_block_index=start // group_block_size,
+                    key=key,
+                    block_id=block_id,
+                )
+
+        return iter_legacy_chunks()
+
+    def _prepare_transfer_value(
+        self,
+        chunk: TransferChunkWithBlockId,
+        block_ids: list[int],
+        kv_cache_group_id: int = 0,
+        cache_role: str = "kv",
+    ):
+        prepare_transfer_value = getattr(self.token_database, "prepare_transfer_value", None)
+        if prepare_transfer_value is not None:
+            return prepare_transfer_value(
+                chunk,
+                block_ids,
+                kv_cache_group_id=kv_cache_group_id,
+                cache_role=cache_role,
+            )
+        return self._prepare_value(
+            chunk.value_start,
+            chunk.value_end,
+            block_ids,
+            kv_cache_group_id=kv_cache_group_id,
+            cache_role=cache_role,
+            block_id=chunk.block_id,
+        )
+
     def _decode_adaptor_prefill_pp(
         self,
         keys: list[str],
@@ -307,59 +381,51 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             store_masks = self._store_mask(req_meta)
             for group_id in req_meta.kv_cache_group_ids or [0]:
-                starts = []
-                ends = []
-                keys = []
-                block_hashes = []
-                key_block_ids = []
                 block_ids = req_meta.block_ids_by_group[group_id]
                 group_block_size = self._get_block_size(group_id)
+                transfer_config = getattr(self.token_database, "hybrid_cache_c128_config", None)
+                event_granularity = (
+                    transfer_config.chunk_tokens
+                    if transfer_config is not None and transfer_config.enabled
+                    else group_block_size
+                )
+                assert event_granularity is not None
                 group_block_hashes = get_block_hashes(
                     req_meta.block_hashes,
-                    group_block_size,
+                    event_granularity,
                     getattr(self.token_database, "hash_block_size", group_block_size),
                 )
-
-                for start, end, key, block_id in self._process_tokens_with_block_ids(
-                    token_len,
-                    req_meta.block_hashes,
-                    block_ids,
-                    kv_cache_group_id=group_id,
-                    skip_null_blocks=self._skip_null_blocks(req_meta, group_id),
-                ):
-                    if not self._mask_allows_chunk(store_masks, group_id, start):
-                        continue
-                    starts.append(start)
-                    ends.append(end)
-                    keys.append(key.to_string())
-                    block_hashes.append(group_block_hashes[start // group_block_size])
-                    key_block_ids.append(block_id)
+                chunks = [
+                    chunk
+                    for chunk in self._process_transfer_chunks_with_block_ids(
+                        token_len,
+                        req_meta.block_hashes,
+                        block_ids,
+                        kv_cache_group_id=group_id,
+                        skip_null_blocks=self._skip_null_blocks(req_meta, group_id),
+                    )
+                    if self._mask_allows_chunk(store_masks, group_id, chunk.raw_start)
+                ]
 
                 if (
                     not self.dcp_size > 1
                     and not req_meta.disable_tp_key_sharding
                     and not self.group_uses_align_state[group_id]
                 ):
-                    starts = starts[self.tp_rank % self.put_step :: self.put_step]
-                    ends = ends[self.tp_rank % self.put_step :: self.put_step]
-                    keys = keys[self.tp_rank % self.put_step :: self.put_step]
-                    block_hashes = block_hashes[self.tp_rank % self.put_step :: self.put_step]
-                    key_block_ids = key_block_ids[self.tp_rank % self.put_step :: self.put_step]
+                    chunks = chunks[self.tp_rank % self.put_step :: self.put_step]
 
-                if not keys:
+                if not chunks:
                     continue
 
+                keys = [chunk.key.to_string() for chunk in chunks]
                 exists_states = self.lookup(keys)
                 missing_indices = [index for index, exists in enumerate(exists_states) if not exists]
 
                 if not missing_indices:
                     continue
 
-                starts = [starts[index] for index in missing_indices]
-                ends = [ends[index] for index in missing_indices]
+                chunks = [chunks[index] for index in missing_indices]
                 keys = [keys[index] for index in missing_indices]
-                block_hashes = [block_hashes[index] for index in missing_indices]
-                key_block_ids = [key_block_ids[index] for index in missing_indices]
 
                 logger.info(
                     "Storing KV cache for %d out of %d blocks (missing_count=%d) for request %s in group %d",
@@ -382,25 +448,36 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 sizes = []
                 stored_events: list[BlockStored] = []
                 prev_key = None
-                new_block_hashes = [maybe_convert_block_hash(bh) for bh in block_hashes]
-                for index, start in enumerate(starts):
-                    addr, size, _ = self._prepare_value(
-                        start,
-                        ends[index],
+                new_block_hashes = [
+                    maybe_convert_block_hash(
+                        group_block_hashes[chunk.raw_start // event_granularity]
+                    )
+                    for chunk in chunks
+                ]
+                for index, chunk in enumerate(chunks):
+                    addr, size, _ = self._prepare_transfer_value(
+                        chunk,
                         block_ids,
                         kv_cache_group_id=group_id,
-                        block_id=key_block_ids[index],
                     )
                     addrs.append(addr)
                     sizes.append(size)
 
                     # Create KV event
                     if self.enable_kv_event:
-                        token_ids = req_meta.token_ids[start : ends[index]] if req_meta.token_ids is not None else None
+                        token_ids = (
+                            req_meta.token_ids[chunk.raw_start : chunk.raw_end]
+                            if req_meta.token_ids is not None
+                            else None
+                        )
                         block_size = (
-                            req_meta.original_block_size[group_id]
-                            if isinstance(req_meta.original_block_size, list)
-                            else req_meta.original_block_size
+                            transfer_config.chunk_tokens
+                            if transfer_config is not None and transfer_config.enabled
+                            else (
+                                req_meta.original_block_size[group_id]
+                                if isinstance(req_meta.original_block_size, list)
+                                else req_meta.original_block_size
+                            )
                         )
                         if block_size is not None:
                             stored_event = BlockStored(
@@ -424,6 +501,18 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         kv_cache_group_id=group_id,
                     )
 
+                if transfer_config is not None and transfer_config.enabled:
+                    logger.info(
+                        "kv Test put request=%s group=%d token_len=%d chunks=%d "
+                        "buffers=%d sample_ranges=%s sample_keys=%s",
+                        req_id,
+                        group_id,
+                        token_len,
+                        len(keys),
+                        sum(len(addr) for addr in addrs),
+                        [(chunk.raw_start, chunk.raw_end) for chunk in chunks[:3]],
+                        keys[:3],
+                    )
                 if current_event is not None:
                     current_event.synchronize()
                 self.m_store.put(keys, addrs, sizes)
