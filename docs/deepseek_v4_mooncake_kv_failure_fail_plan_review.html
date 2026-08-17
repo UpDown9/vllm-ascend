@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DeepSeekV4 Mooncake KV 失败 Fail 方案 — 可行性评审</title>
+  <style>
+    :root { color-scheme: light; --ink:#1f2937; --muted:#52606d; --line:#d9e2ec; --blue:#0b5cab; --bg:#f7f9fc; --warn:#fff7ed; }
+    body { margin:0; font:15px/1.65 system-ui,-apple-system,"Segoe UI","Noto Sans CJK SC",sans-serif; color:var(--ink); background:var(--bg); }
+    main { max-width:1100px; margin:32px auto; padding:0 24px 56px; }
+    h1 { line-height:1.25; margin-bottom:8px; color:#12355b; }
+    h2 { margin-top:32px; color:#174a7c; border-bottom:1px solid var(--line); padding-bottom:6px; }
+    h3 { margin-top:24px; color:#245b8f; }
+    .meta { color:var(--muted); margin-bottom:24px; }
+    .box { background:white; border:1px solid var(--line); border-radius:8px; padding:16px 20px; margin:14px 0; }
+    .recommend { border-left:5px solid #16803c; }
+    .warning { background:var(--warn); border-left:5px solid #d97706; }
+    code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+    code { background:#eef2f7; padding:1px 4px; border-radius:3px; }
+    pre { background:#17202b; color:#eef4fa; padding:14px 16px; border-radius:6px; overflow:auto; }
+    table { border-collapse:collapse; width:100%; background:white; margin:12px 0 20px; }
+    th, td { border:1px solid var(--line); padding:9px 10px; vertical-align:top; text-align:left; }
+    th { background:#eaf1f8; }
+    ul { margin-top:6px; }
+    .small { color:var(--muted); font-size:13px; }
+    .file { color:var(--blue); }
+    .ok { color:#16803c; font-weight:600; }
+    .bad { color:#b91c1c; font-weight:600; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>DeepSeekV4 Mooncake 多 KV Group 失败 Fail 方案 — 可行性评审</h1>
+  <div class="meta">评审对象：<code>docs/deepseek_v4_mooncake_kv_failure_fail_plan.html</code>（v2，2026-08-29 更新）　评审日期：2026-08-29（第三轮）　方式：逐项核对方案引用的仓库代码（vllm-ascend 与上游 vLLM），并与 v1 逐行对比。行号随 checkout 漂移，本文件仅对新发现的问题标注行号，已验证事实以"文件 + 函数名"定位。</div>
+
+  <div class="box recommend">
+    <strong>评审结论（v3）</strong>
+    <p>方案<strong>总体可行</strong>：对现状的描述准确，核心设计（复用 <code>invalid_block_ids → RecomputeScheduler → FINISHED_ERROR</code> 链路、不引入 group_id、只扫 computed-token 覆盖范围）均与代码事实吻合，实施顺序合理。</p>
+    <p><strong>与 v2 对比</strong>：方案第 3.3 节已修正——明确指出上游不存在 <code>get_block_ids_for_computed_tokens()</code>，需自行实现裁剪逻辑。原评审问题 2（命名错误）已解决。</p>
+    <p>当前结论：<span class="bad">剩余 1 项必改</span>（platform 校验时序，见第三节问题 1）；<span class="bad">另有 1 项实施前必须明确</span>——按 group 精确计算有效 block 覆盖范围，禁用任何近似（见第三节问题 3）。在该两项落实前，本评审与原方案均<strong>不建议直接作为最终实施依据</strong>。</p>
+  </div>
+
+  <h2>一、已验证为准确的核心事实</h2>
+  <table>
+    <tr><th>方案声明</th><th>核实结果</th><th>证据位置</th></tr>
+    <tr>
+      <td>V1 connector 只上报 <code>local_block_ids[0]</code></td>
+      <td><span class="ok">属实</span>。多 group 失败时 group 1 及之后确实漏报。</td>
+      <td><span class="file">vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py:592</span>（<code>self.invalid_block_ids.update(local_block_ids[0])</code>）</td>
+    </tr>
+    <tr>
+      <td>Hybrid connector 失败被静默丢弃</td>
+      <td><span class="ok">属实</span>。<code>_handle_request()</code> 异常仅打日志；hybrid 的 <code>MooncakeConnector</code>/<code>MooncakeConnectorWorker</code> 均未实现 <code>get_block_ids_with_load_errors()</code>，基类默认返回空集，Scheduler 收不到任何失败信号。</td>
+      <td><span class="file">vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_hybrid_connector.py:599-600</span>；上游 <code>kv_connector/v1/base.py</code>（<code>KVConnectorBase_V1.get_block_ids_with_load_errors</code> 默认返回空集）</td>
+    </tr>
+    <tr>
+      <td>上游单 group 解包在多 group 下会崩</td>
+      <td><span class="ok">属实</span>。上游用 <code>(req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)</code> 解包，而 <code>get_block_ids()</code> 返回 <code>tuple[list[int], ...]</code>，多 group 时抛 <code>too many values to unpack</code>。</td>
+      <td>上游 <code>vllm/v1/core/sched/scheduler.py</code>（<code>_update_requests_with_invalid_blocks</code>）；<code>vllm/v1/core/kv_cache_manager.py</code>（<code>KVCacheManager.get_block_ids</code>）</td>
+    </tr>
+    <tr>
+      <td>Executor 聚合多 TP/CP worker 的 invalid IDs</td>
+      <td><span class="ok">属实</span>。<code>KVOutputAggregator.aggregate()</code> 对所有 worker 的 <code>invalid_block_ids</code> 做 union。DP 独立 scheduler 不跨 rank 合并的说法同样正确。</td>
+      <td>上游 <code>vllm/distributed/kv_transfer/kv_connector/utils.py</code>（<code>KVOutputAggregator.aggregate</code>，<code>invalid_block_ids |= kv_output.invalid_block_ids</code>）</td>
+    </tr>
+    <tr>
+      <td><code>MultiConnector</code> 自动 union 子 connector</td>
+      <td><span class="ok">属实</span>，无需修改聚合接口，只需 Hybrid 子 connector 实现 getter。</td>
+      <td>上游 <code>kv_connector/v1/multi_connector.py:338-342</code></td>
+    </tr>
+    <tr>
+      <td>fail 链路（<code>finish_requests(FINISHED_ERROR)</code> + <code>EngineCoreOutput</code>）已存在</td>
+      <td><span class="ok">属实</span>，且跳过主循环输出、生成空 token 错误输出的逻辑完整。</td>
+      <td><span class="file">vllm_ascend/core/recompute_scheduler.py:857-865, 1058-1076</span></td>
+    </tr>
+    <tr>
+      <td>hybrid 的 <code>local_block_ids</code> 是 per-group 逻辑 ID</td>
+      <td><span class="ok">属实</span>。类型为 <code>BlockIds</code>（与 V1 connector 相同），"扁平 ID 前提"成立——上报的是 Scheduler 侧逻辑 block ID，可与 scheduler 端 <code>get_block_ids()</code> 结果直接做 membership 检查。</td>
+      <td><span class="file">mooncake_hybrid_connector.py:26, 96</span></td>
+    </tr>
+    <tr>
+      <td>Layerwise connector 已做全 group flatten</td>
+      <td><span class="ok">属实</span>，方案要求补回归测试合理。</td>
+      <td><span class="file">vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_layerwise_connector.py:1418</span></td>
+    </tr>
+    <tr>
+      <td>方案引用的三个测试文件均存在</td>
+      <td><span class="ok">属实</span>。现有 UT 已用 <code>[[10, 20]]</code> 的 BlockIds 格式，扩展为多 group 直接可行。</td>
+      <td><span class="file">tests/ut/kv_offload/test_mooncake_connector.py:496-502</span> 等</td>
+    </tr>
+  </table>
+
+  <h2>二、设计决策评价</h2>
+  <ul>
+    <li><strong>复用 <code>invalid_block_ids</code> 链路、不改上游 dataclass/aggregator</strong>：正确。上游 <code>KVConnectorOutput</code> 与 <code>KVOutputAggregator</code> 的 union 语义天然支持扁平集合，改动面最小。</li>
+    <li><strong>不返回 group_id</strong>：论证正确。fail 决策只需"任意 group 是否命中失败 block"的 membership 检查；引入 group_id 需要同步改上游输出结构、聚合器与全部 connector 接口，收益仅对 recompute 有意义，而本方案明确禁止 recompute。</li>
+    <li><strong>只扫 computed-token 覆盖范围而非全部已分配 block</strong>：与上游语义一致，避免 block ID 重用导致的误匹配（被释放又重新分配的旧 ID 恰好落在新请求的 block 列表中）。</li>
+    <li><strong>保留 P 节点 cleanup 协议</strong>：与现状一致——hybrid 的 finally 块中 DONE 信号（<code>mooncake_hybrid_connector.py:601-612</code>）注释明确说明不发会导致远端内存泄漏。</li>
+    <li><strong>实施顺序</strong>（先加 scheduler 空集合分支 → 再接 connector 上报）：回归风险可控，推荐采纳。</li>
+  </ul>
+
+  <h2>三、问题追踪与剩余风险</h2>
+
+  <h3>问题 1（必改，未修正）：多 group 校验存在时序漏洞（会启动报错）</h3>
+  <div class="box warning">
+    <p><strong>状态：<span class="bad">未解决</span></strong>（v2 第 3.4 节未改动）。方案仍建议把 <code>platform.py:_validate_kv_load_failure_policy()</code> 的拒绝条件改为 <code>len(kv_cache_groups) &gt; 1</code>。但该函数在 <code>check_and_update_config</code> 阶段执行（<span class="file">vllm_ascend/platform.py</span>，<code>check_and_update_config</code> 内），而 <code>kv_cache_config</code> 直到 <code>EngineCore._initialize_kv_caches</code>（worker profile 之后）才产生——校验时该配置<strong>不存在</strong>，直接访问会得到 <code>None</code>/<code>AttributeError</code>。</p>
+    <p><strong>修正建议</strong>（二选一）：</p>
+    <ul>
+      <li>保留现有 <code>is_hybrid</code> 早期校验（hybrid 模型天然多 group），不改动该函数；或</li>
+      <li>把"多 group + recompute"的拒绝延迟到 <code>RecomputeScheduler.__init__</code>——此处 <code>kv_cache_config</code> 已可用（<code>update_from_output</code> 中已在使用 <code>self.kv_cache_config.kv_cache_groups</code>），可安全访问。</li>
+    </ul>
+  </div>
+
+  <h3>问题 2（v2 已解决）：裁剪逻辑的命名错误</h3>
+  <div class="box">
+    <p><strong>状态：<span class="ok">已解决</span></strong>。v1 方案称"优先复用 <code>get_block_ids_for_computed_tokens()</code>"——上游 vLLM 全库不存在此方法；v2 已改为自行实现等价裁剪逻辑，与评审意见一致。</p>
+  </div>
+
+  <h3>问题 3（实施前必须明确）：按 group 精确计算有效 block 覆盖范围，禁用近似</h3>
+  <div class="box warning">
+    <p><strong>不能统一套用 <code>block_size × compress_ratio</code></strong>。该公式不适用于当前 Ascend 实现：<code>AscendCompressorStateCache.get_kv_cache_spec()</code>（<span class="file">vllm_ascend/models/deepseek_v4.py</span>，<code>get_kv_cache_spec</code> 方法）构造 <code>AscendSlidingWindowMLASpec</code> 时<strong>不传 <code>compress_ratio</code></strong>（dataclass 默认 1），压缩效果已体现在 DSV4 各 group 构造时传入的 group-specific <code>block_size</code> 与 <code>page_size_padded</code> 中（来自 <code>DSV4_BLOCK_SIZES</code>）。各 group（MLA / indexer / compressor-SWA）的 token→block 映射语义不同。</p>
+    <p><strong>正确要求</strong>：按具体 KV group 的 spec/manager 语义精确计算有效 tokens-per-block 与覆盖 block 集合——即在 scheduler 侧按 group 取 <code>kv_cache_spec</code> 的实际 block size（而非 scheduler 统一的 <code>self.block_size</code>，也非任何统一公式）。</p>
+    <p><strong>禁用近似</strong>：向上取整的线性近似是<strong>上界</strong>而非下界；对非线性布局（如 SWA group）线性近似甚至无良定义的界。高估覆盖范围会把"仅被本请求本地计算引用、不含外部计算 token"的共享 block 误纳入 membership 检查，导致<strong>健康请求被误 fail</strong>。实现与 UT 都必须按精确映射计算；UT 应覆盖"各 group tokens-per-block 不同"的用例。</p>
+  </div>
+
+  <h2>四、次要说明（不影响可行性）</h2>
+  <ul>
+    <li><code>MooncakeHybridConnector</code> 是 <span class="file">vllm_ascend/distributed/kv_transfer/__init__.py:34</span> 的导出别名，实际类名为 <code>MooncakeConnector</code>（<span class="file">mooncake_hybrid_connector.py:1069</span>），实施时注意定位。</li>
+    <li>Hybrid connector 的 <code>get_finished()</code>（<span class="file">mooncake_hybrid_connector.py:1739</span>）基于 task tracker，失败请求仍会出现在 finished 集合，与方案"Scheduler 同一 step 同时拿到 finished 与 invalid blocks"的预期一致。</li>
+    <li><code>recompute_scheduler_enable</code> 的 D 节点校验已存在（<span class="file">vllm_ascend/platform.py:677-685</span>），方案第 3.4 节的配置约束描述与现状吻合。</li>
+  </ul>
+
+  <h2>五、最终建议（v3）</h2>
+  <div class="box recommend">
+    <p><strong>两项落实前不建议进入实施：</strong></p>
+    <ol>
+      <li><strong>必改</strong>：修正 <code>_validate_kv_load_failure_policy</code> 的多 group 校验时序——保留 <code>is_hybrid</code> 早期校验，或延迟到 <code>RecomputeScheduler.__init__</code> 校验；不修正会导致启动阶段 <code>AttributeError</code>/<code>None</code> 访问。</li>
+      <li><strong>实施前必须明确</strong>：覆盖范围裁剪逻辑按各 group 的 spec/manager 语义<strong>精确计算</strong>有效 tokens-per-block（不得统一套用 <code>block_size × compress_ratio</code>，不得使用向上取整等近似），并在 UT 中覆盖"各 group tokens-per-block 不同"及"共享 block 位于外部计算范围之外不被误 fail"的用例。</li>
+    </ol>
+    <p>其余部分（connector 失败采集、V1 漏报修正、测试矩阵、实施顺序）可直接按方案执行。</p>
+  </div>
+
+  <p class="small">本文件为设计评审记录（第三轮，针对方案 v2），不含运行时代码修改。历史问题状态：问题 2 已由方案 v2 采纳修正；问题 1（必改）与问题 3（实施前必须明确）尚待落实。代码定位统一使用"文件 + 函数名"，行号因 checkout 版本而异，不作稳定性引用。</p>
+</main>
+</body>
+</html>

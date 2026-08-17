@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GLM5.2 / DeepSeek Flash：PD 分离 KV 失败处理分析</title>
+  <style>
+    :root {
+      --bg: #f4f7fb;
+      --paper: #ffffff;
+      --ink: #172033;
+      --muted: #5d6980;
+      --line: #dce3ee;
+      --blue: #2457d6;
+      --blue-soft: #edf3ff;
+      --green: #16785a;
+      --green-soft: #eaf8f2;
+      --amber: #a65d00;
+      --amber-soft: #fff4df;
+      --red: #b42318;
+      --red-soft: #fff0ee;
+      --purple: #6941c6;
+      --purple-soft: #f3efff;
+      --shadow: 0 10px 32px rgba(20, 36, 68, .08);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--bg);
+      font: 15px/1.72 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    }
+    .hero {
+      color: white;
+      background: linear-gradient(125deg, #16254a 0%, #244fa7 56%, #187d76 100%);
+      padding: 54px 24px 46px;
+    }
+    .hero-inner, main { width: min(1180px, calc(100% - 40px)); margin: auto; }
+    h1 { margin: 0 0 12px; font-size: clamp(28px, 4vw, 45px); line-height: 1.18; letter-spacing: -.03em; }
+    .subtitle { max-width: 880px; margin: 0; color: #dce8ff; font-size: 17px; }
+    .meta { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 22px; }
+    .pill { border: 1px solid rgba(255,255,255,.27); border-radius: 999px; padding: 5px 11px; background: rgba(255,255,255,.09); font-size: 13px; }
+    main { padding: 30px 0 70px; }
+    .toc, section { background: var(--paper); border: 1px solid var(--line); border-radius: 15px; box-shadow: var(--shadow); }
+    .toc { padding: 18px 22px; margin-bottom: 24px; }
+    .toc a { color: var(--blue); text-decoration: none; margin-right: 18px; white-space: nowrap; }
+    section { padding: 27px 30px; margin: 22px 0; }
+    h2 { margin: 0 0 18px; font-size: 25px; line-height: 1.3; }
+    h3 { margin: 24px 0 10px; font-size: 19px; }
+    h4 { margin: 18px 0 8px; font-size: 16px; }
+    p { margin: 9px 0; }
+    code { padding: 2px 6px; border-radius: 5px; color: #173568; background: #eef2f8; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    pre { overflow: auto; margin: 12px 0; padding: 15px 17px; border-radius: 10px; color: #e7efff; background: #17233e; font: 13px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    ul, ol { padding-left: 23px; }
+    li { margin: 5px 0; }
+    table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 14px; }
+    th, td { padding: 11px 12px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: #273551; background: #f3f6fa; }
+    .lead { font-size: 16px; color: #35425b; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px; }
+    .card { padding: 17px; border: 1px solid var(--line); border-radius: 12px; background: #fbfcfe; }
+    .card h3, .card h4 { margin-top: 0; }
+    .callout { margin: 15px 0; padding: 13px 16px; border-left: 4px solid var(--blue); border-radius: 7px; background: var(--blue-soft); }
+    .ok { border-left-color: var(--green); background: var(--green-soft); }
+    .warn { border-left-color: var(--amber); background: var(--amber-soft); }
+    .danger { border-left-color: var(--red); background: var(--red-soft); }
+    .purple { border-left-color: var(--purple); background: var(--purple-soft); }
+    .flow { display: flex; align-items: stretch; gap: 8px; overflow-x: auto; padding: 8px 0 12px; }
+    .step { min-width: 145px; flex: 1; padding: 13px; border: 1px solid var(--line); border-radius: 10px; background: #f8fafc; }
+    .step strong { display: block; margin-bottom: 5px; color: #243f78; }
+    .arrow { display: grid; place-items: center; color: #7890bc; font-size: 22px; }
+    .tag { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 650; }
+    .tag-good { color: var(--green); background: var(--green-soft); }
+    .tag-bad { color: var(--red); background: var(--red-soft); }
+    .tag-warn { color: var(--amber); background: var(--amber-soft); }
+    .source { color: var(--muted); font-size: 13px; }
+    .verdict { font-size: 18px; font-weight: 700; }
+    footer { color: var(--muted); text-align: center; padding-top: 12px; font-size: 13px; }
+    @media (max-width: 760px) {
+      .hero-inner, main { width: min(100% - 24px, 1180px); }
+      section { padding: 21px 18px; }
+      .grid { grid-template-columns: 1fr; }
+      .flow { flex-direction: column; }
+      .arrow { transform: rotate(90deg); }
+    }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <div class="hero-inner">
+      <h1>GLM5.2 / DeepSeek Flash<br>PD 分离 KV 失败处理分析</h1>
+      <p class="subtitle">基于当前 vLLM Ascend 代码，分别追踪 P 节点 prefix 命中后 AscendStore/Mooncake Store load 失败，以及 D 节点通过 Mooncake connector 拉取 KV 失败后的真实控制流。</p>
+      <div class="meta">
+        <span class="pill">代码基线 dfa3796f</span>
+        <span class="pill">分析日期 2026-08-25</span>
+        <span class="pill">GLM5.2：MooncakeConnectorV1</span>
+        <span class="pill">DeepSeek Flash：MooncakeHybridConnector</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <nav class="toc">
+      <a href="#summary">结论摘要</a>
+      <a href="#common">公共 Store 链路</a>
+      <a href="#glm">GLM5.2</a>
+      <a href="#deepseek">DeepSeek Flash</a>
+      <a href="#matrix">对比矩阵</a>
+      <a href="#risks">风险与验证点</a>
+      <a href="#sources">代码依据</a>
+    </nav>
+
+    <section id="summary">
+      <h2>1. 结论摘要</h2>
+      <div class="grid">
+        <article class="card">
+          <h3>GLM5.2</h3>
+          <p><b>P 端 Store load 返回失败码或 None：</b>单 KV group 的失败 block 会进入 <code>invalid_block_ids</code>，再由 scheduler 按 P 端的 <code>kv_load_failure_policy=recompute</code> 回退重算。</p>
+          <p><b>D 端 Mooncake pull 失败：</b><code>MooncakeConnectorV1</code> 会记录失败请求和失败 block，同时仍完成 transfer task 与 P 端资源清理；最终 D 端配置 <code>fail</code>，scheduler 应将请求置为错误结束，而不是重算。</p>
+          <span class="tag tag-good">存在失败上报通道</span>
+        </article>
+        <article class="card">
+          <h3>DeepSeek Flash</h3>
+          <p><b>P 端 Store load 失败：</b>hybrid 多 KV group 分支明确“跳过 invalid-block fallback”，只打印错误，不把失败 block 上报 scheduler。</p>
+          <p><b>D 端 Mooncake pull 失败：</b><code>MooncakeHybridConnector</code> 捕获并记录异常，但在 <code>finally</code> 中仍标记接收任务完成、发送 DONE/ACK 清理信号；它没有失败 block 上报接口。</p>
+          <span class="tag tag-bad">当前可出现既不停也不重算</span>
+        </article>
+      </div>
+      <div class="callout danger">
+        <span class="verdict">最关键差异：</span>GLM 的 connector 链路能把失败块送入 scheduler；DeepSeek Flash 当前两个失败点都存在“日志可见、控制面不可见”的缺口。
+      </div>
+    </section>
+
+    <section id="common">
+      <h2>2. P 节点 Store load 的公共入口</h2>
+      <p class="lead">P 节点使用 MultiConnector 时，AscendStoreConnector 负责 prefix lookup 与从 Mooncake Store 恢复 KV；Mooncake P2P connector 负责随后 P→D 的 KV 传输。这是两个独立阶段。</p>
+
+      <h3>2.1 “prefix 命中”不等于“load 成功”</h3>
+      <div class="flow">
+        <div class="step"><strong>Lookup</strong>根据 hash/key 返回命中 token 数</div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>Allocate</strong>scheduler 为命中的外部 KV 分配本地 block</div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>Store get</strong><code>batch_get_into_multi_buffers</code> 真正拷入 NPU KV 地址</div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>Failure report</strong>根据返回码生成 failed block，或因 hybrid 限制仅记日志</div>
+      </div>
+
+      <h3>2.2 MooncakeBackend 对失败的归一化</h3>
+      <ul>
+        <li>底层返回负值：保留负错误码并返回结果列表。</li>
+        <li>底层抛异常：backend 捕获异常、记录日志并返回 <code>None</code>。</li>
+        <li>正值会被归一化成 0；当前代码把 0 当成功、非 0 当失败。</li>
+      </ul>
+      <p class="source">依据：<code>mooncake_backend.py:224-270</code>。</p>
+
+      <h3>2.3 同步与异步 load</h3>
+      <table>
+        <thead><tr><th>模式</th><th>执行位置</th><th>完成方式</th><th>失败记录</th></tr></thead>
+        <tbody>
+          <tr><td><code>load_async=False</code></td><td>model worker 当前执行路径直接调用 Store get</td><td>get 返回后继续 forward</td><td><code>_record_sync_load_failures</code></td></tr>
+          <tr><td><code>load_async=True</code></td><td><code>KVCacheStoreRecvingThread</code></td><td>处理后加入 <code>finished_requests</code></td><td><code>_record_load_failures</code> / 直接更新 invalid block</td></tr>
+        </tbody>
+      </table>
+      <p>两种模式针对“返回失败码/None”的 group 判断一致：单 group 上报 invalid block，多 group 当前只打印 <code>Skip invalid-block fallback to avoid scheduler crash</code>。</p>
+    </section>
+
+    <section id="glm">
+      <h2>3. GLM5.2：MooncakeConnectorV1</h2>
+      <p class="lead">结合提供的配置：P 端 AscendStore <code>load_async=False</code>、failure policy 为 <code>recompute</code>；D 端 MooncakeConnectorV1、failure policy 为 <code>fail</code>。</p>
+
+      <h3>3.1 P 节点 prefix 命中后 Store load 失败</h3>
+      <div class="flow">
+        <div class="step"><strong>Store get</strong>返回非 0 列表或 None</div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>定位失败块</strong><code>record_failed_blocks</code></div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>单 group</strong>写入 worker 的 <code>_invalid_block_ids</code></div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>Connector output</strong>通过 <code>get_block_ids_with_load_errors</code> 上报</div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>Scheduler</strong>识别受影响请求并回退 computed token</div>
+      </div>
+      <ol>
+        <li><code>KVPoolWorker._load_direct_sync_chunks()</code> 调用 <code>m_store.get()</code>。</li>
+        <li><code>_record_sync_load_failures()</code> 把失败返回码映射成本地 block id。</li>
+        <li>GLM5.2 是单 KV cache group 时，失败 id 加入 <code>_invalid_block_ids</code>。</li>
+        <li><code>AscendStoreConnector.get_block_ids_with_load_errors()</code> 把集合交给 model runner 的 connector output。</li>
+        <li>scheduler 的 <code>_handle_invalid_blocks()</code> 找到受影响请求；在 <code>recompute</code> 策略下跳过本轮正常输出并调整请求状态，让失败范围重新计算。</li>
+      </ol>
+      <div class="callout ok"><b>P 端结果：</b>不会把这批失败 KV 当成有效 prefix 直接交付 D；预期是 P 端对失败范围重算。<code>recompute_scheduler_enable=False</code> 不会把 policy 改成 fail——该开关是 PD consumer 的专用 RecomputeScheduler/抢占机制，KV load failure policy 是另一条机制。</div>
+
+      <h4>边界条件</h4>
+      <ul>
+        <li>这里的结论针对 Store get 返回码/None；MooncakeBackend 已将自身捕获到的 get 异常转换为 None。</li>
+        <li>如果失败 block 没有经过 MultiConnector 汇总进最终 connector output，scheduler 就看不到失败；运行时需检查 <code>invalid_block_ids</code>。</li>
+        <li>失败在 forward 前已写入目标地址，但 scheduler 是在 model runner output 返回后处理，因此本轮结果必须被跳过，不能接受该轮采样输出。</li>
+      </ul>
+
+      <h3>3.2 D 节点通过 MooncakeConnectorV1 拉取 KV 失败</h3>
+      <div class="flow">
+        <div class="step"><strong>Mooncake read</strong><code>batch_transfer_sync_read</code> 返回 &lt; 0 或抛异常</div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>捕获失败</strong><code>transfer_failed=True</code></div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>标记</strong>request 加入 failed set；local blocks 加入 invalid set</div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>清理</strong>仍 task done、DONE_RECVING、释放 P 端资源</div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>上层策略</strong>D 配置 fail → 请求 FINISHED_ERROR</div>
+      </div>
+      <ol>
+        <li>传输函数在返回码小于 0 时抛 <code>RuntimeError</code>。</li>
+        <li><code>_handle_request()</code> 捕获异常，调用 <code>_mark_failed_recv_request()</code>；同一请求后续 shard/task 会被跳过并继续标失败。</li>
+        <li>无论成功失败，<code>finally</code> 都减少 task 计数；最后一个 task 会调用 <code>task_tracker.update_done_task_count()</code>。</li>
+        <li>无论成功失败，都向 P 端发送完成/清理信号，避免 P 端 block 与端口泄漏。这个 DONE 表示“传输生命周期结束”，不表示“KV 内容有效”。</li>
+        <li>worker 通过 <code>get_block_ids_with_load_errors()</code> 取走 invalid block；scheduler 根据 D 端 <code>kv_load_failure_policy=fail</code> 将受影响请求错误结束并返回空 token 输出。</li>
+      </ol>
+      <div class="callout warn"><b>容易误判的日志：</b>P 端收到 DONE/ACK 并释放 KV，并不能证明 D 拉取成功。成功与失败都走同一资源清理协议，必须结合 D 端 <code>Failed to transfer KV cache</code> 与 scheduler 的 FINISHED_ERROR 日志判断。</div>
+    </section>
+
+    <section id="deepseek">
+      <h2>4. DeepSeek Flash：MooncakeHybridConnector</h2>
+      <p class="lead">DeepSeek Flash 使用 hybrid/compressed KV cache 多 group。当前 AscendStore 与 MooncakeHybridConnector 都没有形成完整的失败闭环。</p>
+
+      <h3>4.1 P 节点 prefix 命中后 Store load 失败</h3>
+      <div class="flow">
+        <div class="step"><strong>Store get</strong>返回非 0 或 None</div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>定位失败块</strong>生成 missing block ids</div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>多 group 分支</strong>只打印错误</div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>不上报</strong>不写入 <code>_invalid_block_ids</code></div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>继续</strong>同步路径继续 forward；异步路径标记 recv finished</div>
+      </div>
+      <pre>KV load failed for hybrid request %s.
+Skip invalid-block fallback to avoid scheduler crash.
+failed_blocks=%s</pre>
+      <p>同步路径的 <code>_record_sync_load_failures()</code> 和异步路径的 <code>_record_load_failures()</code> 都有同样的保护：当 <code>len(block_ids_by_group) &gt; 1</code> 时不更新 invalid block 集合。</p>
+      <div class="callout danger"><b>P 端结果：</b>当前只有错误日志，没有请求级 fail，也没有 recompute。同步 load 会继续进入 forward；异步 load 会把请求加入完成集合。若失败地址仍保留旧值/未初始化内容，后续计算与 P→D 传输存在错误 KV 风险。</div>
+      <p>此外，平台校验明确禁止 hybrid 模型使用 <code>kv_load_failure_policy=recompute</code>，因此即使启动参数尝试设置 recompute，也会在配置校验阶段 assert，而不是获得回退能力。</p>
+
+      <h3>4.2 D 节点通过 MooncakeHybridConnector 拉取 KV 失败</h3>
+      <div class="flow">
+        <div class="step"><strong>Mooncake read</strong>返回 &lt; 0 后抛 RuntimeError</div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>内部捕获</strong>只执行 <code>logger.exception</code></div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>finally</strong>仍发送 remote-port cleanup 与 DONE_RECVING</div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>标记完成</strong>最后 task 更新 task tracker</div>
+        <div class="arrow">→</div>
+        <div class="step"><strong>Scheduler 视角</strong>只看到 recv finished，看不到 invalid block</div>
+      </div>
+      <p><code>MooncakeHybridConnector._handle_request()</code> 在内部吞掉传输异常；与 MooncakeConnectorV1 不同，它没有：</p>
+      <ul>
+        <li><code>failed_recv_requests</code> 请求失败集合；</li>
+        <li><code>invalid_block_ids</code> 失败块集合；</li>
+        <li><code>get_block_ids_with_load_errors()</code> 对外接口。</li>
+      </ul>
+      <div class="callout danger"><b>D 端结果：</b>当前代码会把失败的拉取任务当作“生命周期已完成”上报，scheduler 无法依据 <code>fail</code> 或 <code>recompute</code> policy 做动作。因此你描述的“既不会停止，也不会重算”与当前代码一致。</div>
+    </section>
+
+    <section id="matrix">
+      <h2>5. 处理结果对比矩阵</h2>
+      <table>
+        <thead>
+          <tr><th>模型 / 失败点</th><th>底层错误记录</th><th>失败块上报 scheduler</th><th>请求动作</th><th>P 端资源清理</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><b>GLM5.2 P Store load</b></td><td><span class="tag tag-good">有</span></td><td><span class="tag tag-good">有，单 group</span></td><td>P policy=recompute，回退重算失败范围</td><td>此时尚未进入 D pull 清理</td>
+          </tr>
+          <tr>
+            <td><b>GLM5.2 D Mooncake pull</b></td><td><span class="tag tag-good">有</span></td><td><span class="tag tag-good">有</span></td><td>D policy=fail，请求错误结束</td><td><span class="tag tag-good">仍执行</span></td>
+          </tr>
+          <tr>
+            <td><b>DeepSeek P Store load</b></td><td><span class="tag tag-good">有日志</span></td><td><span class="tag tag-bad">无，多 group 主动跳过</span></td><td>继续执行；不停止、不重算</td><td>此时尚未进入 D pull 清理</td>
+          </tr>
+          <tr>
+            <td><b>DeepSeek D Hybrid pull</b></td><td><span class="tag tag-good">有日志</span></td><td><span class="tag tag-bad">无接口</span></td><td>recv 被视为完成；不停止、不重算</td><td><span class="tag tag-good">仍执行</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="risks">
+      <h2>6. 风险、运行时验证点与修复方向</h2>
+      <h3>6.1 建议抓取的关键日志/状态</h3>
+      <div class="grid">
+        <article class="card">
+          <h4>GLM5.2</h4>
+          <ul>
+            <li><code>Failed to get ... keys</code></li>
+            <li>connector output 中的 <code>invalid_block_ids</code></li>
+            <li>scheduler 是否调用 invalid-block handler</li>
+            <li>D 端 <code>Failed to transfer KV cache</code></li>
+            <li>最终请求是否 <code>FINISHED_ERROR</code></li>
+          </ul>
+        </article>
+        <article class="card">
+          <h4>DeepSeek Flash</h4>
+          <ul>
+            <li><code>Skip invalid-block fallback to avoid scheduler crash</code></li>
+            <li><code>Failed to transfer KV cache</code></li>
+            <li>失败后是否仍出现 receive finished / DONE_RECVING / ACK</li>
+            <li>确认没有 invalid block output</li>
+            <li>观察后续 decode 是否继续并出现错误输出</li>
+          </ul>
+        </article>
+      </div>
+
+      <h3>6.2 当前最需要补齐的代码能力</h3>
+      <ol>
+        <li><b>Hybrid Store load：</b>需要 group-aware 的 invalid-block 表达与 scheduler 回退，不能简单把多个 group 的 block id 扁平为一个集合。</li>
+        <li><b>MooncakeHybridConnector：</b>仿照 MooncakeConnectorV1 增加 request failure tracking、各 group 的失败 block 上报，并在所有 pull task 完成后保留失败状态。</li>
+        <li><b>Policy：</b>让上层明确区分 <code>fail</code> 与 group-aware <code>recompute</code>；在 recompute 尚未支持前，至少 fail-fast，避免使用不完整 KV 继续 decode。</li>
+        <li><b>协议语义：</b>资源清理 DONE 与数据成功必须分离；DONE 可继续用于释放 P 资源，但还应有独立 success/failure 状态。</li>
+        <li><b>测试：</b>补充“lookup hit + get miss/错误码”“部分 TP/PP task 失败”“最后 task 失败”“多 group 部分失败”的回归测试。</li>
+      </ol>
+      <div class="callout purple"><b>安全优先建议：</b>在 DeepSeek group-aware recompute 完成前，D pull 或 P Store load 失败应让请求显式 FINISHED_ERROR；继续 decode 的静默错误风险高于失败返回。</div>
+    </section>
+
+    <section id="sources">
+      <h2>7. 代码依据</h2>
+      <table>
+        <thead><tr><th>主题</th><th>文件与行号</th><th>关键事实</th></tr></thead>
+        <tbody>
+          <tr><td>Store get 返回值</td><td><code>vllm_ascend/.../backend/mooncake_backend.py:224-270</code></td><td>负码返回；异常转 None</td></tr>
+          <tr><td>同步 load 失败</td><td><code>vllm_ascend/.../ascend_store/pool_worker.py:492-512, 619-643</code></td><td>单 group 写 invalid；多 group 只记日志</td></tr>
+          <tr><td>异步 load 失败</td><td><code>vllm_ascend/.../ascend_store/kv_transfer.py:533-635, 637-658</code></td><td>同样按单/多 group 分叉；之后标完成</td></tr>
+          <tr><td>AscendStore 上报接口</td><td><code>vllm_ascend/.../ascend_store/ascend_store_connector.py:238-249</code></td><td>暴露 finished request 与 load error block</td></tr>
+          <tr><td>GLM Mooncake pull 失败</td><td><code>vllm_ascend/.../kv_p2p/mooncake_connector.py:529-531, 592-610, 695-728</code></td><td>记录 failed request/invalid block；finally 清理</td></tr>
+          <tr><td>GLM error block 接口</td><td><code>vllm_ascend/.../kv_p2p/mooncake_connector.py:2331-2356</code></td><td>consumer 对外返回失败 block</td></tr>
+          <tr><td>DeepSeek pull 失败</td><td><code>vllm_ascend/.../kv_p2p/mooncake_hybrid_connector.py:601-629, 709-716</code></td><td>异常内部吞掉；仍 done 与 cleanup</td></tr>
+          <tr><td>DeepSeek worker 输出</td><td><code>vllm_ascend/.../kv_p2p/mooncake_hybrid_connector.py:1739-1758</code></td><td>只有 finished 集合，无失败块接口</td></tr>
+          <tr><td>Scheduler policy</td><td><code>vllm_ascend/core/recompute_scheduler.py:857-865, 1058-1070</code></td><td>invalid block 触发回退；非 recompute 则 FINISHED_ERROR</td></tr>
+          <tr><td>Hybrid recompute 限制</td><td><code>vllm_ascend/platform.py:871-879</code></td><td>hybrid 模型禁止 recompute load failure policy</td></tr>
+          <tr><td>RecomputeScheduler 开关语义</td><td><code>vllm_ascend/ascend_config.py:139-151</code></td><td>PD consumer 专用，不等同于 KV load failure policy</td></tr>
+        </tbody>
+      </table>
+      <div class="callout"><b>范围说明：</b>报告分析的是当前工作区代码，不代表其他 vLLM/vLLM Ascend 版本。MultiConnector 的公共聚合和 scheduler 基础实现来自配套 vLLM；本文以本仓库对外接口及 RecomputeScheduler 中可见的 policy 处理为依据。</div>
+    </section>
+
+    <footer>vLLM Ascend PD KV failure-flow code analysis · Generated from current workspace</footer>
+  </main>
+</body>
+</html>
