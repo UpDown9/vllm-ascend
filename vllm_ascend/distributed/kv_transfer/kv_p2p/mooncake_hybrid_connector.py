@@ -67,6 +67,7 @@ if TYPE_CHECKING:
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
+MOONCAKE_DIAG_PREFIX = "[MOONCAKE_DIAG]"
 
 
 # A busy peer can otherwise keep a global executor worker forever when the
@@ -473,7 +474,7 @@ class KVCacheRecvingThread(threading.Thread):
         """Add a new request to the queue for processing."""
         if remote_port_send_num is None:
             remote_port_send_num = {}
-        logger.debug("Adding request %s to the queue.", request_id)
+        logger.info("%s KV_ENQUEUE request_id=%s queue_size=%d", MOONCAKE_DIAG_PREFIX, request_id, self.request_queue.qsize()) if self.tp_rank == 0 else None
         self.request_queue.put(
             {
                 "request_id": request_id,
@@ -590,12 +591,12 @@ class KVCacheRecvingThread(threading.Thread):
         all_task_done = req_meta["all_task_done"]
 
         try:
-            logger.debug("Starting to transfer KV cache for request %s.", remote_request_id)
+            logger.info("%s KV_TRANSFER_BEGIN request_id=%s remote_request_id=%s", MOONCAKE_DIAG_PREFIX, request_id, remote_request_id)
             if not self.use_hybrid:
                 self._transfer_kv_cache(req_meta)
             else:
                 self._transfer_kv_cache_all_groups(req_meta)
-            logger.debug("Finished transferring KV cache for request %s.", remote_request_id)
+            logger.info("%s KV_TRANSFER_END request_id=%s remote_request_id=%s", MOONCAKE_DIAG_PREFIX, request_id, remote_request_id)
         except Exception:
             logger.exception("Failed to transfer KV cache for request %s.", remote_request_id)
         finally:
@@ -701,7 +702,8 @@ class KVCacheRecvingThread(threading.Thread):
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
         logger.info(
-            "KV cache transfer for request %s took %.2f ms. local_ip %s local_device_id %s remote_session_id %s",
+            "%s KV_TRANSFER request_id=%s took %.2f ms. local_ip %s local_device_id %s remote_session_id %s",
+            MOONCAKE_DIAG_PREFIX,
             remote_request_id,
             req_transfer_elapsed,
             get_ip(),
@@ -801,8 +803,8 @@ class KVCacheRecvingThread(threading.Thread):
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
         logger.info(
-            "KV cache transfer for request %s took %.2f ms (%d groups,"
-            " %d blocks). local_ip %s local_device_id %s remote_session_id %s",
+            "%s KV_TRANSFER request_id=%s took %.2f ms (%d groups, %d blocks). local_ip %s local_device_id %s remote_session_id %s",
+            MOONCAKE_DIAG_PREFIX,
             remote_request_id,
             req_transfer_elapsed,
             num_transfer_groups,
@@ -1750,8 +1752,9 @@ class MooncakeConnectorWorker:
             else set()
         )
         if self.tp_rank == 0:
-            logger.debug(
-                "Number of completed KV cache send requests: %d, receive requests: %d",
+            logger.info(
+                "%s KV_FINISHED send_requests=%d receive_requests=%d",
+                MOONCAKE_DIAG_PREFIX,
                 len(done_sending),
                 len(done_recving),
             )

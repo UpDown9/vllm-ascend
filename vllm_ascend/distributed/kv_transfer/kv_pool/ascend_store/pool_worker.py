@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import math
 import threading
+import time
 from collections.abc import Generator
 
 import torch
@@ -69,6 +70,8 @@ backend_map = {
     },
 }
 
+
+STORE_DIAG_PREFIX = "[MOONCAKE_DIAG]"
 
 class KVPoolWorker:
     # The main class for the cache engine.
@@ -639,7 +642,17 @@ class KVPoolWorker:
             len(key_list_c),
             key_list_c[:3],
         )
+        store_load_start = time.perf_counter()
         ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+        load_bytes = sum(sum(x) if isinstance(x, list) else x for x in size_list_c)
+        logger.info(
+            "%s STORE_LOAD request_id=%s keys=%d bytes=%d elapsed_ms=%.2f",
+            STORE_DIAG_PREFIX,
+            request.req_id,
+            len(key_list_c),
+            load_bytes,
+            (time.perf_counter() - store_load_start) * 1000,
+        )
         self._record_sync_load_failures(request, block_id_list_c, ret)
 
     def _load_c128_sync_chunks(
@@ -674,7 +687,17 @@ class KVPoolWorker:
             addr_list = addr_list[rotation:] + addr_list[:rotation]
             size_list = size_list[rotation:] + size_list[:rotation]
             block_id_list = block_id_list[rotation:] + block_id_list[:rotation]
+            store_load_start = time.perf_counter()
             ret = self.m_store.get(key_list, addr_list, size_list)
+            load_bytes = sum(sum(x) if isinstance(x, list) else x for x in size_list)
+            logger.info(
+                "%s STORE_LOAD request_id=%s keys=%d bytes=%d elapsed_ms=%.2f",
+                STORE_DIAG_PREFIX,
+                request.req_id,
+                len(key_list),
+                load_bytes,
+                (time.perf_counter() - store_load_start) * 1000,
+            )
             self._record_sync_load_failures(request, block_id_list, ret)
 
     def _align_kv_ptrs(self, registered_regions: dict[int, tuple[int, int]]):

@@ -38,7 +38,7 @@ import torch.nn as nn
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
+from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group
@@ -128,6 +128,7 @@ from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
+MODEL_DIAG_PREFIX = "[MOONCAKE_DIAG]"
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
@@ -1987,6 +1988,22 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        diag_req_ids = [
+            request.req_id
+            for request in scheduler_output.scheduled_new_reqs
+            if scheduler_output.num_scheduled_tokens.get(request.req_id, 0) > 0
+        ]
+        diag_req_ids.extend(
+            req_id
+            for req_id in scheduler_output.scheduled_cached_reqs.req_ids
+            if scheduler_output.num_scheduled_tokens.get(req_id, 0) > 0
+        )
+        self._diag_real_model_step = (
+            self.is_kv_producer
+            and get_tensor_model_parallel_rank() == 0
+            and scheduler_output.total_num_scheduled_tokens > 0
+        )
+        self._diag_req_ids = diag_req_ids
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
                 self.routed_experts_capturer.clear_buffer()
@@ -2353,11 +2370,23 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            diag_start = time.perf_counter()
+            if self._diag_real_model_step:
+                self._sync_device()
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            if self._diag_real_model_step:
+                self._sync_device()
+                logger.info(
+                    "%s MODEL_FORWARD req_ids=%s elapsed_ms=%.2f tokens=%d",
+                    MODEL_DIAG_PREFIX,
+                    self._diag_req_ids,
+                    (time.perf_counter() - diag_start) * 1000.0,
+                    num_tokens_padded,
+                )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:

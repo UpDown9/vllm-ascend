@@ -988,6 +988,7 @@ async def assign_instances(
     prefiller_key = prefiller["key"]
 
     try:
+        prefill_start = time.perf_counter()
         response = await send_request_to_service(
             await runtime.get_client(ServerRole.PREFILL, prefiller_key),
             api,
@@ -995,6 +996,12 @@ async def assign_instances(
             request_id,
             max_retries=args.max_retries,
             base_delay=args.retry_delay,
+        )
+        logger.info(
+            "[MOONCAKE_DIAG] PROXY_PREFILL_RETURN request_id=%s prefiller=%s elapsed_ms=%.2f",
+            request_id,
+            prefiller_key,
+            (time.perf_counter() - prefill_start) * 1000.0,
         )
     except Exception:
         await _abort_prefill_selection(runtime, prefiller_key, prefiller_score, is_initial_request=is_initial_request)

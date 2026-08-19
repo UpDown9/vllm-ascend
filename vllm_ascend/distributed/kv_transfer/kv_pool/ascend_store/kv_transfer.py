@@ -1,5 +1,6 @@
 import queue
 import threading
+import time
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -11,6 +12,7 @@ from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
+STORE_DIAG_PREFIX = "[MOONCAKE_DIAG]"
 
 # isort: off
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
@@ -496,7 +498,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
                 if current_event is not None:
                     current_event.synchronize()
+                store_put_start = time.perf_counter()
                 self.m_store.put(keys, addrs, sizes)
+                if self.kv_role in ("kv_producer", "kv_both") and self.tp_rank == 0:
+                    put_bytes = sum(sum(x) if isinstance(x, list) else x for x in sizes)
+                    logger.info("%s STORE_PUT request_id=%s keys=%d bytes=%d elapsed_ms=%.2f", STORE_DIAG_PREFIX, req_id, len(keys), put_bytes, (time.perf_counter() - store_put_start) * 1000)
 
                 # TODO Query specific replica info to update the event
                 if self.enable_kv_event and stored_events is not None:
@@ -591,7 +597,17 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             len(key_list_c),
             key_list_c[:3],
         )
+        store_load_start = time.perf_counter()
         ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+        load_bytes = sum(sum(x) if isinstance(x, list) else x for x in size_list_c)
+        logger.info(
+            "%s STORE_LOAD request_id=%s keys=%d bytes=%d elapsed_ms=%.2f",
+            STORE_DIAG_PREFIX,
+            req_id,
+            len(key_list_c),
+            load_bytes,
+            (time.perf_counter() - store_load_start) * 1000,
+        )
         if ret is not None and any(r != 0 for r in ret):
             missing_block_ids = record_failed_blocks(
                 block_id_list_c,
@@ -714,7 +730,17 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             addr_list = addr_list[rotation:] + addr_list[:rotation]
             size_list = size_list[rotation:] + size_list[:rotation]
             block_id_list = block_id_list[rotation:] + block_id_list[:rotation]
+            store_load_start = time.perf_counter()
             results = self.m_store.get(key_list, addr_list, size_list)
+            load_bytes = sum(sum(x) if isinstance(x, list) else x for x in size_list)
+            logger.info(
+                "%s STORE_LOAD request_id=%s keys=%d bytes=%d elapsed_ms=%.2f",
+                STORE_DIAG_PREFIX,
+                req_id,
+                len(key_list),
+                load_bytes,
+                (time.perf_counter() - store_load_start) * 1000,
+            )
             self._record_load_failures(req_meta, block_id_list, results)
 
         c128_groups: dict[int, list[TransferChunkWithBlockId]] = defaultdict(list)
@@ -746,7 +772,17 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             page_addrs = page_addrs[rotation:] + page_addrs[:rotation]
             page_sizes = page_sizes[rotation:] + page_sizes[:rotation]
             page_block_ids = page_block_ids[rotation:] + page_block_ids[:rotation]
+            store_load_start = time.perf_counter()
             results = self.m_store.get(page_keys, page_addrs, page_sizes)
+            load_bytes = sum(sum(x) if isinstance(x, list) else x for x in page_sizes)
+            logger.info(
+                "%s STORE_LOAD request_id=%s keys=%d bytes=%d elapsed_ms=%.2f",
+                STORE_DIAG_PREFIX,
+                req_id,
+                len(page_keys),
+                load_bytes,
+                (time.perf_counter() - store_load_start) * 1000,
+            )
             self._record_load_failures(req_meta, page_block_ids, results)
 
         self.set_finished_request(req_id)
