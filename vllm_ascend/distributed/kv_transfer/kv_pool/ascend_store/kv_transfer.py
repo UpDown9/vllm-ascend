@@ -34,6 +34,7 @@ class KVTransferThread(threading.Thread):
         dcp_size: int,
         ready_event: threading.Event,
         name: str,
+        enable_async_requests: bool = False,
     ):
         super().__init__(daemon=True, name=name)
         self.m_store = m_store
@@ -45,7 +46,14 @@ class KVTransferThread(threading.Thread):
         self.done_task_lock = threading.Lock()
         self.request_queue: queue.Queue[Any] = queue.Queue()
         # TODO(jianzs): make this configurable
-        self.executor = ThreadPoolExecutor(max_workers=32)
+        # Prepare is intentionally serialized to limit CPU contention with forward.
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        # Commit waits and puts are independent per request.
+        self.commit_executor = ThreadPoolExecutor(max_workers=1, initializer=self.m_store.set_device)
+        # Independent send tasks may wait on separate NPU events.
+        self.enable_async_requests = enable_async_requests
+        self.prepared_requests: dict[str, tuple[ReqMeta, list]] = {}
+        self.prepared_requests_lock = threading.Lock()
         self.finished_requests: set[str] = set()
         self.kv_event_lock = threading.Lock()
         self.kv_events: list[BlockStored] = []
@@ -89,7 +97,11 @@ class KVTransferThread(threading.Thread):
                     logger.warning("Received a None request. This indicates queue shutdown or invalid request.")
                     self.request_queue.task_done()
                     continue
-                self._handle_request(request_data)
+                if self.enable_async_requests:
+                    future = self.executor.submit(self._handle_request, request_data)
+                    future.add_done_callback(self._log_request_failure)
+                else:
+                    self._handle_request(request_data)
             except Exception as e:
                 logger.error(
                     "Error in KVCacheTransferThread(%s). type=%s, error=%s. Check thread state and request processing.",
@@ -97,6 +109,17 @@ class KVTransferThread(threading.Thread):
                     type(e).__name__,
                     e,
                 )
+
+    def _log_request_failure(self, future) -> None:
+        """Surface exceptions raised by asynchronously handled requests."""
+        try:
+            future.result()
+        except Exception as e:
+            logger.error(
+                "Error in asynchronous KVCacheTransferThread(%s). type=%s, error=%s",
+                self.name, type(e).__name__, e
+            )
+
 
     def _handle_request(self, req_meta: Any):
         pass
@@ -335,7 +358,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         enable_kv_event: bool = False,
     ):
         super().__init__(
-            m_store, token_database, block_size, tp_rank, dcp_size, ready_event, name="KVCacheSendingThread"
+            m_store, token_database, block_size, tp_rank, dcp_size, ready_event, name="KVCacheSendingThread", enable_async_requests=True
         )
         self.put_step = put_step
         self.kv_role = kv_role
@@ -376,12 +399,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
         token_len = req_meta.token_len_chunk
         req_id = req_meta.req_id
         current_event = req_meta.current_event
+        prepare_only = getattr(req_meta, "_prepare_only", False)
         try:
             if req_id not in self.stored_requests:
                 self.request_queue.task_done()
                 return
 
             store_masks = self._store_mask(req_meta)
+            pending_puts = []
             for group_id in req_meta.kv_cache_group_ids or [0]:
                 block_ids = req_meta.block_ids_by_group[group_id]
                 group_block_size = self._get_block_size(group_id)
@@ -419,21 +444,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 if not chunks:
                     continue
 
+                # Prepare builds the complete candidate batch. Lookup is
+                # intentionally deferred until commit, immediately before put.
                 keys = [chunk.key.to_string() for chunk in chunks]
-                exists_states = self.lookup(keys)
-                missing_indices = [index for index, exists in enumerate(exists_states) if not exists]
-
-                if not missing_indices:
-                    continue
-
-                chunks = [chunks[index] for index in missing_indices]
-                keys = [keys[index] for index in missing_indices]
 
                 logger.info(
-                    "Storing KV cache for %d out of %d blocks (missing_count=%d) for request %s in group %d",
+                    "Preparing KV cache for %d blocks for request %s in group %d",
                     len(keys),
-                    token_len // group_block_size,
-                    len(missing_indices),
                     req_id,
                     group_id,
                 )
@@ -494,18 +511,94 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         kv_cache_group_id=group_id,
                     )
 
-                if current_event is not None:
-                    current_event.synchronize()
-                self.m_store.put(keys, addrs, sizes)
+                pending_puts.append((keys, addrs, sizes, group_id, stored_events))
 
+            # Prepare is deliberately complete before any event wait. Cache
+            # the result so the single prepare worker is free for the next
+            # request; wait_for_save() performs the commit phase.
+            if getattr(req_meta, "_prepare_only", False):
+                with self.prepared_requests_lock:
+                    self.prepared_requests[req_id] = (req_meta, pending_puts)
+                # The return runs the finally block but skips statements after
+                # it, so mark the queue item done explicitly here.
+                self.request_queue.task_done()
+                return
+
+            # Synchronous fallback path.
+            ready_event = getattr(req_meta, "_save_ready_event", None)
+            if ready_event is not None:
+                ready_event.wait()
+            if current_event is not None:
+                current_event.synchronize()
+
+            if pending_puts:
+                all_keys = []
+                all_addrs = []
+                all_sizes = []
+                all_events = []
+                for keys, addrs, sizes, _group_id, stored_events in pending_puts:
+                    all_keys.extend(keys)
+                    all_addrs.extend(addrs)
+                    all_sizes.extend(sizes)
+                    all_events.extend(stored_events)
+                if all_keys:
+                    exists_states = self.lookup(all_keys)
+                    missing_indices = [i for i, exists in enumerate(exists_states) if not exists]
+                    all_keys = [all_keys[i] for i in missing_indices]
+                    all_addrs = [all_addrs[i] for i in missing_indices]
+                    all_sizes = [all_sizes[i] for i in missing_indices]
+                    if all_keys:
+                        self.m_store.put(all_keys, all_addrs, all_sizes)
                 # TODO Query specific replica info to update the event
-                if self.enable_kv_event and stored_events is not None:
-                    self.update_kv_event(stored_events)
+                if self.enable_kv_event and all_events:
+                    self.update_kv_event(all_events)
         finally:
-            # always free blocks
-            self.mark_completed_events(req_meta.event_id)
-        self.dec_stored_request(req_id)
+            # Blocks remain owned until commit for prepare-only requests.
+            if not prepare_only:
+                self.mark_completed_events(req_meta.event_id)
+        if not prepare_only:
+            self.dec_stored_request(req_id)
         self.request_queue.task_done()
+
+    def commit_request(self, req_id: str) -> None:
+        with self.prepared_requests_lock:
+            prepared = self.prepared_requests.pop(req_id, None)
+        if prepared is None:
+            # A failed prepare still needs to release the request accounting.
+            self.mark_completed_events(req_id)
+            self.dec_stored_request(req_id)
+            return
+        req_meta, pending_puts = prepared
+        try:
+            logger.debug("KV commit start req=%s batches=%d", req_id, len(pending_puts))
+            if req_meta.current_event is not None:
+                req_meta.current_event.synchronize()
+            all_keys, all_addrs, all_sizes, all_events = [], [], [], []
+            for keys, addrs, sizes, _group_id, stored_events in pending_puts:
+                all_keys.extend(keys)
+                all_addrs.extend(addrs)
+                all_sizes.extend(sizes)
+                all_events.extend(stored_events)
+            if all_keys:
+                # Check freshness immediately before writing. Prepare no longer
+                # performs lookup, so forward execution is not coupled to the
+                # metadata RPC and its result processing.
+                exists_states = self.lookup(all_keys)
+                missing_indices = [i for i, exists in enumerate(exists_states) if not exists]
+                missing_keys = [all_keys[i] for i in missing_indices]
+                missing_addrs = [all_addrs[i] for i in missing_indices]
+                missing_sizes = [all_sizes[i] for i in missing_indices]
+                logger.debug("KV commit put req=%s keys=%d missing=%d", req_id, len(all_keys), len(missing_keys))
+                if missing_keys:
+                    self.m_store.put(missing_keys, missing_addrs, missing_sizes)
+                if all_events:
+                    all_events = [all_events[i] for i in missing_indices]
+            if self.enable_kv_event and all_events:
+                self.update_kv_event(all_events)
+        finally:
+            self.mark_completed_events(req_meta.event_id)
+            self.dec_stored_request(req_id)
+
 
 
 class KVCacheStoreRecvingThread(KVTransferThread):
@@ -767,7 +860,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         enable_kv_event: bool = False,
     ):
         super().__init__(
-            m_store, token_database, block_size, tp_rank, dcp_size, ready_event, name="KVCacheStoreLayerSendingThread"
+            m_store, token_database, block_size, tp_rank, dcp_size, ready_event, name="KVCacheStoreLayerSendingThread", enable_async_requests=True
         )
         self.final_layer_id = num_layers - 1
         self.put_step = put_step

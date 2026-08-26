@@ -843,6 +843,18 @@ class KVPoolWorker:
         self.current_layer = 0
         self.layerwise_retrievers = []
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
+        # Submit save requests before model execution. The send worker performs
+        # CPU metadata preparation (chunks, keys and lookup) immediately, then
+        # waits on the event recorded by wait_for_save before writing KV data.
+        if not self.use_layerwise and (self.kv_role != "kv_consumer" or self.consumer_is_to_put):
+            for request in metadata.requests:
+                if request.can_save:
+                    request.skip_null_blocks_by_group = self.group_uses_align_state
+                    request.current_event = torch.npu.Event()
+                    request._prepare_only = True
+                    request._save_ready_event = threading.Event()
+                    self.kv_send_thread.add_stored_request(request.req_id)  # type: ignore[union-attr]
+                    self.kv_send_thread.add_request(request)  # type: ignore[union-attr]
         for request in metadata.requests:
             load_spec = request.load_spec
             if load_spec is None or not load_spec.can_load:  # load =0
@@ -962,36 +974,26 @@ class KVPoolWorker:
         self.current_layer = self.current_layer + 1
 
     def wait_for_save(self, connector_metadata: AscendConnectorMetadata):
-        current_event = None
-        has_save_request = False
-        for request in connector_metadata.requests:
-            can_save = request.can_save
-            if can_save is None or not can_save:
-                continue
-            current_event = torch.npu.Event()
-            current_event.record()
-            break
+        save_requests = [request for request in connector_metadata.requests if request.can_save]
+        has_save_request = bool(save_requests)
 
-        for request in connector_metadata.requests:
-            can_save = request.can_save
-            if can_save is None or not can_save:
-                continue
-
-            request.skip_null_blocks_by_group = self.group_uses_align_state
-            request.current_event = current_event
-            self.kv_send_thread.add_stored_request(  # type: ignore[union-attr]
-                request.req_id
-            )
-            self.kv_send_thread.add_request(  # type: ignore[union-attr]
-                request,
-            )
-            has_save_request = True
+        # Each request has its own event, then commits can wait independently.
+        for request in save_requests:
+            if request.current_event is not None:
+                request.current_event.record()
 
         if has_save_request:
-            # vLLM expects wait_for_save() to make stores visible before the
-            # request is reported as finished. Without this barrier a following
-            # identical prompt can lookup before Mooncake put() has completed.
+            # Prepare tasks have already completed (queue join), then commit
+            # each request after its forward event is recorded.
             self.kv_send_thread.request_queue.join()  # type: ignore[union-attr]
+            commit_futures = [
+                self.kv_send_thread.commit_executor.submit(  # type: ignore[union-attr]
+                    self.kv_send_thread.commit_request, request.req_id  # type: ignore[union-attr]
+                )
+                for request in save_requests
+            ]
+            for future in commit_futures:
+                future.result()
 
     def retrieve_layer(
         self,
