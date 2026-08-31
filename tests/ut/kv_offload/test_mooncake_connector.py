@@ -493,10 +493,11 @@ class TestKVCacheRecvingThreadBasic(unittest.TestCase):
         self.assertEqual(queued["num_computed_tokens"], 0)
 
     def test_mark_and_is_failed(self):
-        self.thread._mark_failed_recv_request("req1", [[10, 20]])
+        self.thread._mark_failed_recv_request("req1", [[10, 20], [30]])
         self.assertTrue(self.thread._is_failed_recv_request("req1"))
         self.assertIn(10, self.thread.invalid_block_ids)
         self.assertIn(20, self.thread.invalid_block_ids)
+        self.assertIn(30, self.thread.invalid_block_ids)
 
     def test_clear_failed_recv_request(self):
         self.thread._mark_failed_recv_request("req2", [[30]])

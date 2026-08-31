@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 from collections import defaultdict, deque
 from dataclasses import dataclass, fields
 
@@ -97,6 +98,7 @@ class RecomputeScheduler(Scheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._validate_multi_group_kv_load_failure_policy()
         # When is_mtp_kv_consumer is true, we will fill request.spec_token_ids
         # with placeholder tokens to enable full graph when decode nodes pull
         # the KV cache of one request from prefill nodes.
@@ -106,6 +108,14 @@ class RecomputeScheduler(Scheduler):
             and self.vllm_config.kv_transfer_config.is_kv_consumer
         )
         self.is_kv_producer = self.vllm_config.kv_transfer_config and self.vllm_config.kv_transfer_config.is_kv_producer
+
+    def _validate_multi_group_kv_load_failure_policy(self) -> None:
+        num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
+        if num_kv_cache_groups > 1 and self.recompute_kv_load_failures:
+            raise ValueError(
+                "Multi-group KV caches do not support recomputing KV load "
+                "failures. Set kv_load_failure_policy='fail'."
+            )
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
@@ -826,6 +836,91 @@ class RecomputeScheduler(Scheduler):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
+    def _find_multi_group_requests_with_invalid_blocks(
+        self,
+        requests: Iterable[Request],
+        invalid_block_ids: set[int],
+        collect_blocks_to_evict: bool,
+    ) -> tuple[set[str], set[int]]:
+        """Match connector-reported block IDs against active requests.
+
+        Connectors report the scheduler logical block IDs that were actual
+        load destinations. Those blocks remain referenced by an active request
+        until this output is handled. Multi-group managers share one BlockPool,
+        so these logical IDs are unique across groups. Matching the current
+        per-group block tables therefore avoids model-specific token-to-block
+        approximations.
+        """
+        affected_req_ids: set[str] = set()
+        blocks_to_evict: set[int] = set()
+
+        for request in requests:
+            request_is_affected = False
+            block_ids_by_group = self.kv_cache_manager.get_block_ids(request.request_id)
+            for group_block_ids in block_ids_by_group:
+                first_invalid_index = next(
+                    (
+                        index
+                        for index, block_id in enumerate(group_block_ids)
+                        if block_id in invalid_block_ids
+                    ),
+                    None,
+                )
+                if first_invalid_index is None:
+                    continue
+
+                request_is_affected = True
+                if collect_blocks_to_evict:
+                    # Keep the upstream sync-load behavior: evict the invalid
+                    # block and the downstream blocks that depend on it.
+                    blocks_to_evict.update(group_block_ids[first_invalid_index:])
+
+            if request_is_affected:
+                affected_req_ids.add(request.request_id)
+
+        return affected_req_ids, blocks_to_evict
+
+    def _handle_multi_group_invalid_blocks_for_fail(self, invalid_block_ids: set[int]) -> set[str]:
+        async_load_requests = (
+            request
+            for request in self.skipped_waiting
+            if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        )
+        async_failed_req_ids, _ = self._find_multi_group_requests_with_invalid_blocks(
+            async_load_requests,
+            invalid_block_ids,
+            collect_blocks_to_evict=False,
+        )
+        sync_failed_req_ids, sync_blocks_to_evict = self._find_multi_group_requests_with_invalid_blocks(
+            self.running,
+            invalid_block_ids,
+            collect_blocks_to_evict=True,
+        )
+
+        if sync_blocks_to_evict:
+            self.kv_cache_manager.evict_blocks(sync_blocks_to_evict)
+
+        failed_req_ids = async_failed_req_ids | sync_failed_req_ids
+        if failed_req_ids:
+            logger.error(
+                "[KVLoadFailure][multi-group] failing requests=%s "
+                "invalid_blocks=%s groups=%d",
+                sorted(failed_req_ids),
+                sorted(invalid_block_ids),
+                len(self.kv_cache_config.kv_cache_groups),
+            )
+        return failed_req_ids
+
+    def _handle_invalid_blocks(
+        self, invalid_block_ids: set[int], num_scheduled_tokens: dict[str, int]
+    ) -> set[str]:
+        if len(self.kv_cache_config.kv_cache_groups) == 1:
+            return super()._handle_invalid_blocks(invalid_block_ids, num_scheduled_tokens)
+
+        if self.recompute_kv_load_failures:
+            raise RuntimeError("Multi-group KV load failure recomputation is not supported.")
+        return self._handle_multi_group_invalid_blocks_for_fail(invalid_block_ids)
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1057,6 +1152,12 @@ class RecomputeScheduler(Scheduler):
 
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
+            logger.error(
+                "[KVLoadFailure] kv_load_failure_policy=fail; terminating requests=%s "
+                "because invalid KV blocks failed to load: %s",
+                sorted(failed_kv_load_req_ids),
+                sorted(kv_connector_output.invalid_block_ids) if kv_connector_output else [],
+            )
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
                 outputs[request.client_index].append(

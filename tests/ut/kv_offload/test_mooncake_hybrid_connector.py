@@ -50,7 +50,44 @@ class TestHybridKVCacheRecvingThreadDispatch(unittest.TestCase):
         thread.request_task_counts = defaultdict(int)
         thread.finished_request_markers = set()
         thread.request_task_counts_lock = threading.Lock()
+        thread._invalid_block_ids = set()
+        thread._invalid_block_ids_lock = threading.Lock()
         return thread
+
+    def test_failed_request_reports_all_group_block_ids_once(self):
+        thread = self._make_thread()
+
+        thread._mark_failed_recv_request("req-1", ([10, 11], [20]))
+
+        self.assertEqual(thread.get_and_clear_invalid_block_ids(), {10, 11, 20})
+        self.assertEqual(thread.get_and_clear_invalid_block_ids(), set())
+
+    def test_transfer_failure_reports_blocks_and_keeps_cleanup(self):
+        thread = self._make_thread()
+        thread.use_hybrid = True
+        thread._transfer_kv_cache_all_groups = MagicMock(
+            side_effect=RuntimeError("transfer failed")
+        )
+        thread._send_done_signal_to_free_remote_port = MagicMock()
+        thread._send_done_recv_signal = MagicMock()
+        thread._mark_request_task_done = MagicMock(return_value=False)
+        thread.request_queue = MagicMock()
+        req_meta = {
+            "request_id": "req-1",
+            "remote_request_id": "remote-req-1",
+            "remote_host": "host-a",
+            "remote_handshake_port": 6000,
+            "remote_port_send_num": {},
+            "all_task_done": True,
+            "local_block_ids": ([10, 11], [20]),
+        }
+
+        thread._handle_request(req_meta)
+
+        self.assertEqual(thread.get_and_clear_invalid_block_ids(), {10, 11, 20})
+        thread._send_done_signal_to_free_remote_port.assert_called_once()
+        thread._send_done_recv_signal.assert_called_once()
+        thread.request_queue.task_done.assert_called_once_with()
 
     def test_submit_request_serializes_same_peer_fifo(self):
         thread = self._make_thread()
