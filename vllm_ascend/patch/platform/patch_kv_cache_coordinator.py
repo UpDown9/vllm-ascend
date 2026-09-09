@@ -20,6 +20,7 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
+    CrossAttentionManager,
     SingleTypeKVCacheManager,
     SlidingWindowManager,
 )
@@ -28,8 +29,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
+    SlidingWindowSpec,
 )
 
+from vllm_ascend import envs
 from vllm_ascend.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
 
 USE_MULTI_GROUPS_KV_CACHE = True
@@ -50,11 +53,26 @@ def _is_deepseek_v4_kv_cache_spec(kv_cache_spec: KVCacheSpec) -> bool:
     elif not isinstance(nested_specs, (list, tuple, set)):
         return False
 
-    return any(getattr(spec, "model_version", None) == "deepseek_v4" for spec in nested_specs)
+    return any(_is_deepseek_v4_kv_cache_spec(spec) for spec in nested_specs)
 
 
 def _is_deepseek_v4_kv_cache_config(kv_cache_config: KVCacheConfig) -> bool:
     return any(_is_deepseek_v4_kv_cache_spec(group.kv_cache_spec) for group in kv_cache_config.kv_cache_groups)
+
+
+def _is_private_swa_group_spec(kv_cache_spec: KVCacheSpec) -> bool:
+    """Return whether a cache group consists exclusively of DSV4 SWA specs."""
+    if isinstance(kv_cache_spec, SlidingWindowSpec):
+        return getattr(kv_cache_spec, "model_version", None) == "deepseek_v4"
+    nested = getattr(kv_cache_spec, "kv_cache_specs", None)
+    if isinstance(nested, Mapping):
+        nested = tuple(nested.values())
+    elif isinstance(nested, (list, tuple, set)):
+        nested = tuple(nested)
+    else:
+        return False
+    return bool(nested) and all(_is_private_swa_group_spec(spec) for spec in nested)
+
 
 
 class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
@@ -134,6 +152,16 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+
+        self.private_swa_group_ids = (
+            frozenset(
+                i
+                for i, manager in enumerate(self.single_type_managers)
+                if _is_private_swa_group_spec(manager.kv_cache_spec)
+            ) if envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL else frozenset()
+        )
+        self.private_swa_pool = None
+        self.private_swa_config = None
 
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -238,6 +266,95 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         block_sizes = [self._get_effective_block_size(spec) for spec, _, _ in self.attention_groups]
         self.lcm_block_size = lcm(*block_sizes)
 
+    def cache_blocks(self, request, num_computed_tokens: int) -> None:
+        """Cache shared groups while keeping request-private SWA unhashed."""
+        for group_id, manager in enumerate(self.single_type_managers):
+            if group_id in self.private_swa_group_ids:
+                continue
+            manager.cache_blocks(
+                request,
+                num_computed_tokens,
+                retention_interval=self.retention_interval,
+            )
+
+    def get_num_blocks_to_allocate(
+        self, request_id, num_tokens, new_computed_blocks, num_encoder_tokens,
+        total_computed_tokens, num_tokens_main_model,
+        apply_admission_cap=False,
+    ) -> int:
+        """Count only shared-pool blocks; private SWA is reserved atomically."""
+        total = 0
+        for group_id, manager in enumerate(self.single_type_managers):
+            if group_id in self.private_swa_group_ids:
+                continue
+            if isinstance(manager, CrossAttentionManager):
+                total += manager.get_num_blocks_to_allocate(
+                    request_id, num_encoder_tokens, [], 0,
+                    num_encoder_tokens, apply_admission_cap=apply_admission_cap)
+            else:
+                total += manager.get_num_blocks_to_allocate(
+                    request_id, num_tokens, new_computed_blocks[group_id],
+                    total_computed_tokens, num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap)
+        return total
+
+    def allocate_new_computed_blocks(
+        self, request_id, new_computed_blocks, num_local_computed_tokens,
+        num_external_computed_tokens,
+    ) -> None:
+        """Attach prefix-hit and external blocks for shared cache groups.
+
+        ``SingleTypeKVCacheManager`` owns the complete local-hit/external-KV
+        allocation protocol. In particular, it performs the running-request
+        fast path and handles sliding-window null blocks. Keep private SWA
+        groups out of that protocol because their blocks are request-private.
+        """
+        for group_id, manager in enumerate(self.single_type_managers):
+            if group_id in self.private_swa_group_ids:
+                continue
+            manager.allocate_new_computed_blocks(
+                request_id,
+                new_computed_blocks[group_id],
+                num_local_computed_tokens,
+                num_external_computed_tokens,
+            )
+
+    def allocate_new_blocks(
+        self, request_id, num_tokens, num_tokens_main_model,
+        num_encoder_tokens=0,
+    ):
+        result = []
+        for gid, manager in enumerate(self.single_type_managers):
+            if gid in self.private_swa_group_ids:
+                result.append([])
+            else:
+                result.append(manager.allocate_new_blocks(
+                    request_id,
+                    num_encoder_tokens if isinstance(manager, CrossAttentionManager)
+                    else num_tokens,
+                    num_tokens_main_model))
+        return tuple(result)
+
+    def free(self, request_id: str) -> None:
+        for gid, manager in enumerate(self.single_type_managers):
+            if gid not in self.private_swa_group_ids:
+                manager.free(request_id)
+
+    def remove_skipped_blocks(
+        self, request_id: str, processed_computed_tokens: int,
+    ) -> None:
+        for gid, manager in enumerate(self.single_type_managers):
+            if gid not in self.private_swa_group_ids:
+                manager.remove_skipped_blocks(
+                    request_id, processed_computed_tokens)
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
+        return [
+            0 if gid in self.private_swa_group_ids else
+            manager.get_num_common_prefix_blocks(running_request_id)
+            for gid, manager in enumerate(self.single_type_managers)
+        ]
+
     def find_longest_cache_hit(
         self,
         block_hashes: list[BlockHash],
@@ -287,6 +404,10 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         while True:
             curr_hit_length = hit_length
             for idx, (spec, group_ids, manager_cls) in enumerate(self.attention_groups):
+                if any(group_id in self.private_swa_group_ids for group_id in group_ids):
+                    for group_id in group_ids:
+                        hit_blocks_by_group[group_id] = []
+                    continue
                 effective_block_size = self._get_effective_block_size(spec)
                 cached_blocks = hit_blocks_by_group[group_ids[0]]
                 if isinstance(spec, FullAttentionSpec) and cached_blocks is not None:
@@ -379,6 +500,10 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         while True:
             curr_hit_length = hit_length
             for idx, (spec, group_ids, manager_cls) in enumerate(self.attention_groups):
+                if any(group_id in self.private_swa_group_ids for group_id in group_ids):
+                    for group_id in group_ids:
+                        hit_blocks_by_group[group_id] = []
+                    continue
                 # In PD disaggregation, Mamba running/temporal state is transferred
                 # via the KV connector, but the D side has no local Mamba prefix
                 # cache hit. If we let Mamba groups participate in the min-reduction,

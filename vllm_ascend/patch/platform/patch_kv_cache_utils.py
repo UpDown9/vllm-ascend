@@ -26,6 +26,12 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.private_swa_pool import (
+    PrivateSWAConfig,
+    compute_private_swa_prefill_workspace_blocks,
+    is_private_swa_kv_cache_spec,
+)
+from vllm_ascend import envs
 from vllm_ascend.utils import vllm_version_is
 
 
@@ -106,7 +112,15 @@ def _ascend_free_queue_append_n(self: FreeKVCacheBlockQueue, blocks: list[KVCach
     _orig_free_queue_append_n(self, _filter_queue_insert_blocks(blocks, "FreeKVCacheBlockQueue.append_n"))
 
 
+_ORIGINAL_GROUP_AND_UNIFY = vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs
+_ORIGINAL_UNIFORM_GROUPS = vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
+_ORIGINAL_PACKED_CONFIG = getattr(
+    vllm.v1.core.kv_cache_utils, "_get_kv_cache_config_packed",
+    getattr(vllm.v1.core.kv_cache_utils, "_get_kv_cache_config_deepseek_v4", None),
+)
+
+_ORIGINAL_GET_KV_CACHE_CONFIGS = vllm.v1.core.kv_cache_utils.get_kv_cache_configs
 
 
 def _ascend_resolve_kv_cache_block_sizes(
@@ -154,6 +168,9 @@ def group_and_unify_kv_cache_specs(
     Group the KV cache specs and unify each group into one UniformTypeKVCacheSpecs.
     Currently, this is only used for DeepseekV4.
     """
+    if not envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL:
+        return _ORIGINAL_GROUP_AND_UNIFY(kv_cache_spec)
+
     if not any(isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()):
         return None
 
@@ -184,6 +201,8 @@ def group_and_unify_kv_cache_specs(
 def _get_kv_cache_groups_uniform_groups(
     grouped_specs: list[UniformTypeKVCacheSpecs],
 ) -> list[KVCacheGroupSpec]:
+    if not envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL:
+        return _ORIGINAL_UNIFORM_GROUPS(grouped_specs)
     """
     Generate the KV cache groups from the grouped specs.
     """
@@ -278,62 +297,204 @@ def _get_kv_cache_config_deepseek_v4(
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
 ) -> tuple[int, list[KVCacheTensor]]:
-    """DeepseekV4 KV cache tensor layout planning.
+    """Plan shared DeepSeek-V4 caches plus a physically separate SWA pool.
 
-    Precondition: kv_cache_groups[0] is the full-MLA group; its page sizes
-    define the canonical bucket set. Non-full-MLA groups must have been
-    page_size-padded upstream (see _get_kv_cache_groups_uniform_groups) so
-    every layer's page_size matches one of the full-MLA bucket sizes.
-
-    For each group, bucket its layers by page_size_bytes and place each
-    layer at tuple_idx = position-within-bucket. Emit one KVCacheTensor
-    per (tuple_idx, bucket) whose shared_by is the union of per-group
-    layers at that slot.
+    Private SWA layers are deliberately omitted from packed/shared tensors.
+    Each receives exactly ``2 * max_num_seqs`` fixed ring allocations and is
+    therefore independent of the shared BlockPool's block count.
     """
+    if not envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL:
+        if _ORIGINAL_PACKED_CONFIG is None:
+            raise RuntimeError("vLLM packed KV cache planner is unavailable")
+        return _ORIGINAL_PACKED_CONFIG(vllm_config, kv_cache_groups, available_memory)
+
     full_mla_spec = kv_cache_groups[0].kv_cache_spec
     assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
     page_sizes = sorted(full_mla_spec.get_page_sizes())
-    layer_tuple_page_bytes = sum(page_sizes)
 
-    # Pre-bucket each group's layers by page_size (registration order within
-    # bucket). bucketed[g_idx][page_size] = [layer_name, ...].
-    mtp_layer_names = []
+    private_layers: list[tuple[str, KVCacheSpec]] = []
+    mtp_layer_names: list[str] = []
     mtp_page_size = 0
     bucketed: list[dict[int, list[str]]] = []
     for group in kv_cache_groups:
         assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         specs = group.kv_cache_spec.kv_cache_specs
-        b: dict[int, list[str]] = defaultdict(list)
+        bucket: dict[int, list[str]] = defaultdict(list)
         for name in group.layer_names:
-            if "mtp" not in name:
-                b[specs[name].page_size_bytes].append(name)
-            else:
+            spec = specs[name]
+            if (isinstance(spec, SlidingWindowMLASpec)
+                    and getattr(spec, "model_version", None) == "deepseek_v4"):
+                private_layers.append((name, spec))
+            elif "mtp" in name:
                 mtp_layer_names.append(name)
-                mtp_page_size = specs[name].page_size_bytes
-        bucketed.append(b)
+                mtp_page_size = spec.page_size_bytes
+            else:
+                bucket[spec.page_size_bytes].append(name)
+        bucketed.append(bucket)
 
-    # num_layer_tuples = longest bucket list across all groups. For the
-    # full-MLA group this equals the count of layers in the largest
-    # per-page-size bucket (= get_num_layer_tuples()); for SWA sub-groups
-    # this equals the sub-group size (each has a single page_size).
-    num_layer_tuples = max(len(layers) for b in bucketed for layers in b.values()) + len(mtp_layer_names)
+    if not private_layers:
+        raise RuntimeError("DeepSeek-V4 cache layout has no private SWA layer")
+    first_private = private_layers[0][1]
+    if any((spec.block_size, spec.sliding_window, spec.page_size_bytes)
+           != (first_private.block_size, first_private.sliding_window,
+               first_private.page_size_bytes)
+           for _, spec in private_layers):
+        raise RuntimeError("all DeepSeek-V4 private SWA layers must share one layout")
 
-    num_blocks = available_memory // (layer_tuple_page_bytes * num_layer_tuples)
+    draft_tokens = (getattr(vllm_config.speculative_config,
+                            "num_speculative_tokens", 0)
+                    if vllm_config.speculative_config is not None else 0)
+    private_config = PrivateSWAConfig(
+        block_size=first_private.block_size,
+        window_size=first_private.sliding_window,
+        in_flight_tokens=1 + draft_tokens,
+        max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+    )
+    private_bytes = (len(private_layers) * private_config.num_blocks
+                     * first_private.page_size_bytes)
+    # Prefill forwards are eager and serialized, so all DSV4 SWA layers share
+    # one address-stable PA workspace. Reserve the same bound used at runtime:
+    # per request, max(W-1 history, W rollback) plus page-alignment slack.
+    prefill_workspace_blocks = compute_private_swa_prefill_workspace_blocks(
+        max_num_batched_tokens=(
+            vllm_config.scheduler_config.max_num_batched_tokens
+        ),
+        max_num_seqs=private_config.max_num_seqs,
+        window_size=private_config.window_size,
+        block_size=private_config.block_size,
+    )
+    prefill_workspace_bytes = (
+        prefill_workspace_blocks * first_private.page_size_bytes)
+    reserved_private_bytes = private_bytes + prefill_workspace_bytes
+    if reserved_private_bytes >= available_memory:
+        raise ValueError(
+            "Insufficient KV memory for DeepSeek-V4 private SWA pool and "
+            "Prefill workspace: "
+            f"private={private_bytes}, workspace={prefill_workspace_bytes}, "
+            f"available={available_memory}")
+
+    # Only shared cache layers participate in the normal profiled budget.
+    shared_page_sizes = sorted({ps for bucket in bucketed for ps in bucket})
+    layer_tuple_page_bytes = sum(shared_page_sizes)
+    shared_tuple_count = max(
+        (len(layers) for bucket in bucketed for layers in bucket.values()),
+        default=0,
+    )
+    total_shared_tuples = shared_tuple_count + len(mtp_layer_names)
+    if layer_tuple_page_bytes <= 0 or total_shared_tuples <= 0:
+        raise RuntimeError("DeepSeek-V4 cache layout has no shared cache layers")
+    num_blocks = ((available_memory - reserved_private_bytes)
+                  // (layer_tuple_page_bytes * total_shared_tuples))
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
     kv_cache_tensors: list[KVCacheTensor] = []
-    for tuple_idx in range(num_layer_tuples - len(mtp_layer_names)):
-        for ps in page_sizes:
+    for tuple_idx in range(shared_tuple_count):
+        for page_size in shared_page_sizes:
             shared_by: list[str] = []
-            for b in bucketed:
-                bucket = b.get(ps)
-                if bucket is not None and tuple_idx < len(bucket):
-                    shared_by.append(bucket[tuple_idx])
-            kv_cache_tensors.append(KVCacheTensor(size=ps * num_blocks, shared_by=shared_by))
-    for i in range(len(mtp_layer_names)):
-        kv_cache_tensors.append(KVCacheTensor(size=mtp_page_size * num_blocks, shared_by=[mtp_layer_names[i]]))
+            for bucket in bucketed:
+                layers = bucket.get(page_size)
+                if layers is not None and tuple_idx < len(layers):
+                    shared_by.append(layers[tuple_idx])
+            if shared_by:
+                kv_cache_tensors.append(KVCacheTensor(
+                    size=page_size * num_blocks, shared_by=shared_by))
+    for name in mtp_layer_names:
+        kv_cache_tensors.append(KVCacheTensor(
+            size=mtp_page_size * num_blocks, shared_by=[name]))
+    # Append fixed-size private SWA tensors only after vLLM has aligned the
+    # shared tensors across ranks. get_kv_cache_configs() assumes every tensor
+    # scales with num_blocks, which is intentionally false for this ring pool.
 
+    logger.info(
+        "DeepSeek-V4 private SWA pool: layers=%d allocations=%d "
+        "blocks_per_allocation=%d blocks=%d bytes=%d "
+        "prefill_workspace_blocks=%d prefill_workspace_bytes=%d "
+        "shared_blocks=%d",
+        len(private_layers), private_config.num_allocations,
+        private_config.blocks_per_allocation, private_config.num_blocks,
+        private_bytes, prefill_workspace_blocks, prefill_workspace_bytes,
+        num_blocks)
     return num_blocks, kv_cache_tensors
+
+
+_PRIVATE_SWA_TENSOR_ATTR = "_vllm_ascend_private_swa"
+
+
+def _private_swa_config_for(
+    vllm_config: VllmConfig, spec: SlidingWindowMLASpec
+) -> PrivateSWAConfig:
+    draft_tokens = (
+        getattr(vllm_config.speculative_config, "num_speculative_tokens", 0)
+        if vllm_config.speculative_config is not None
+        else 0
+    )
+    return PrivateSWAConfig(
+        block_size=spec.block_size,
+        window_size=spec.sliding_window,
+        in_flight_tokens=1 + draft_tokens,
+        max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+    )
+
+
+def _iter_private_swa_layers(
+    kv_cache_config: KVCacheConfig,
+) -> list[tuple[str, SlidingWindowMLASpec]]:
+    private_layers: list[tuple[str, SlidingWindowMLASpec]] = []
+    for group in kv_cache_config.kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        specs = getattr(group_spec, "kv_cache_specs", None)
+        for layer_name in group.layer_names:
+            layer_spec = specs[layer_name] if isinstance(specs, dict) else group_spec
+            if (
+                isinstance(layer_spec, SlidingWindowMLASpec)
+                and is_private_swa_kv_cache_spec(layer_spec)
+            ):
+                private_layers.append((layer_name, layer_spec))
+    return private_layers
+
+
+def _append_private_swa_tensors(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> None:
+    """Append fixed-size private tensors after shared-pool rank alignment."""
+    private_layers = _iter_private_swa_layers(kv_cache_config)
+    if not private_layers:
+        return
+    existing_layers = {
+        layer_name
+        for tensor in kv_cache_config.kv_cache_tensors
+        for layer_name in tensor.shared_by
+    }
+    first_config = _private_swa_config_for(vllm_config, private_layers[0][1])
+    for layer_name, layer_spec in private_layers:
+        if layer_name in existing_layers:
+            continue
+        private_config = _private_swa_config_for(vllm_config, layer_spec)
+        if private_config != first_config:
+            raise RuntimeError("all DeepSeek-V4 private SWA layers must share one layout")
+        tensor = KVCacheTensor(
+            size=layer_spec.page_size_bytes * private_config.num_blocks,
+            shared_by=[layer_name],
+        )
+        # The dynamic marker survives normal Python process transfer. Workers
+        # also derive private membership from the layer spec as a safe fallback.
+        setattr(tensor, _PRIVATE_SWA_TENSOR_ATTR, True)
+        kv_cache_config.kv_cache_tensors.append(tensor)
+
+
+def _ascend_get_kv_cache_configs(
+    vllm_config: VllmConfig,
+    kv_cache_specs: list[dict[str, KVCacheSpec]],
+    available_memory: list[int],
+) -> list[KVCacheConfig]:
+    """Keep private-SWA tensor sizes out of shared rank-size normalization."""
+    kv_cache_configs = _ORIGINAL_GET_KV_CACHE_CONFIGS(
+        vllm_config, kv_cache_specs, available_memory
+    )
+    if envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL:
+        for kv_cache_config in kv_cache_configs:
+            _append_private_swa_tensors(vllm_config, kv_cache_config)
+    return kv_cache_configs
 
 
 BlockPool.free_blocks = _ascend_free_blocks
@@ -345,6 +506,7 @@ vllm.v1.core.kv_cache_utils.FreeKVCacheBlockQueue.append_n = _ascend_free_queue_
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
+vllm.v1.core.kv_cache_utils.get_kv_cache_configs = _ascend_get_kv_cache_configs
 # vllm v0.24.0 renamed _get_kv_cache_config_deepseek_v4 to _get_kv_cache_config_packed and
 # get_kv_cache_config_from_groups now calls _get_kv_cache_config_packed directly, bypassing
 # the alias patch above. Patch the canonical name so Ascend's non-packed layout is used.
@@ -357,3 +519,4 @@ else:
 import vllm.v1.engine.core  # noqa: E402
 
 vllm.v1.engine.core.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+vllm.v1.engine.core.get_kv_cache_configs = _ascend_get_kv_cache_configs

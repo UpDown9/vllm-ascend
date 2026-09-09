@@ -103,6 +103,8 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend import envs
+from vllm_ascend.core.private_swa_pool import PrivateSWAConfig
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
@@ -272,9 +274,25 @@ class NPUModelRunner(GPUModelRunner):
         # the following PR is merged:
         # https://github.com/vllm-project/vllm/pull/28988
         max_pcp_pad_tokens = (
-            vllm_config.parallel_config.prefill_context_parallel_size * 2 * vllm_config.scheduler_config.max_num_seqs
+            vllm_config.parallel_config.prefill_context_parallel_size
+            * 2
+            * vllm_config.scheduler_config.max_num_seqs
         )
-        vllm_config.scheduler_config.max_num_batched_tokens += max_pcp_pad_tokens
+        hf_text_config = getattr(
+            vllm_config.model_config, "hf_text_config", None
+        )
+        private_swa_window_size = int(
+            getattr(hf_text_config, "sliding_window", 0) or 0
+        )
+        max_private_swa_rollback_tokens = (
+            private_swa_window_size
+            * vllm_config.scheduler_config.max_num_seqs
+            if envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL
+            else 0
+        )
+        vllm_config.scheduler_config.max_num_batched_tokens += (
+            max_pcp_pad_tokens + max_private_swa_rollback_tokens
+        )
 
         # Must be set before super().__init__() because parent init may call
         # _allocate_kv_cache_tensors which accesses self.use_compress.
@@ -324,7 +342,13 @@ class NPUModelRunner(GPUModelRunner):
                 dtype=torch.int32,
             )
 
-        vllm_config.scheduler_config.max_num_batched_tokens -= max_pcp_pad_tokens
+        vllm_config.scheduler_config.max_num_batched_tokens -= (
+            max_pcp_pad_tokens + max_private_swa_rollback_tokens
+        )
+        self._private_swa_rollback_capacity_tokens = (
+            max_private_swa_rollback_tokens
+        )
+        self._private_swa_window_size = private_swa_window_size
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -431,9 +455,11 @@ class NPUModelRunner(GPUModelRunner):
             self.model_config.max_model_len += 2 * self.pcp_size * self.max_num_reqs
             if not self.vllm_config.cache_config.enable_prefix_caching:
                 self.vllm_config.cache_config.mamba_block_size = self.model_config.max_model_len
-        max_buffer_num_tokens = self.max_num_tokens
+        max_buffer_num_tokens = (
+            self.max_num_tokens + self._private_swa_rollback_capacity_tokens
+        )
         if self.pcp_size * self.dcp_size > 1:
-            max_buffer_num_tokens = self.max_num_tokens + self.max_num_reqs * 2 * self.pcp_size
+            max_buffer_num_tokens += self.max_num_reqs * 2 * self.pcp_size
             self.pcp_manager = PCPManager(
                 self.pcp_size,
                 self.pcp_rank,
@@ -451,6 +477,11 @@ class NPUModelRunner(GPUModelRunner):
             self.input_ids = self._make_buffer(max_buffer_num_tokens, dtype=torch.int32)
             self.positions = torch.zeros(
                 max_buffer_num_tokens, dtype=torch.int64, device=self.device)
+
+        # Keep the exact execution-buffer capacity for later multi-group
+        # InputBatch reinitialization. Scheduler accounting remains
+        # self.max_num_tokens; rollback/PCP padding is runner-local capacity.
+        self._max_input_batch_tokens = max_buffer_num_tokens
 
         self.sfa_dcp_replicated_indexer_size = 1
         if enable_sfa_dcp_replicated_indexer():
@@ -545,7 +576,7 @@ class NPUModelRunner(GPUModelRunner):
         self.input_batch = NPUInputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=max(self.model_config.max_model_len, self.max_encoder_len),
-            max_num_batched_tokens=self.max_num_tokens,
+            max_num_batched_tokens=self._max_input_batch_tokens,
             device=self.device,
             pin_memory=self.pin_memory,
             vocab_size=self.model_config.get_vocab_size(),
@@ -741,7 +772,59 @@ class NPUModelRunner(GPUModelRunner):
                 if num_computed_tokens < req_state.num_computed_tokens:
                     req_state.prev_num_draft_len = 0
 
-        return super()._update_states(scheduler_output)
+        callback = super()._update_states(scheduler_output)
+
+        private_metadata = getattr(scheduler_output, "private_swa_metadata", None)
+        if not envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL:
+            private_metadata = None
+        if private_metadata is not None:
+            if not hasattr(self, "_private_swa_metadata_by_req"):
+                self._private_swa_metadata_by_req: dict[str, dict[str, Any]] = {}
+            self._private_swa_metadata_by_req.update(private_metadata)
+            for req_id in getattr(scheduler_output, "finished_req_ids", ()):
+                self._private_swa_metadata_by_req.pop(req_id, None)
+
+            num_reqs = self.input_batch.num_reqs
+            allocations = np.full(num_reqs, -1, dtype=np.int64)
+            window_starts = np.zeros(num_reqs, dtype=np.int64)
+            valid_lengths = np.zeros(num_reqs, dtype=np.int64)
+            blocks_per_allocation = 0
+            num_allocations = 0
+            private_num_blocks = 0
+            for row, req_id in enumerate(self.input_batch.req_ids):
+                metadata = self._private_swa_metadata_by_req.get(req_id)
+                if metadata is None:
+                    continue
+                allocations[row] = metadata["allocation_handle"]
+                window_starts[row] = metadata["window_start"]
+                valid_lengths[row] = metadata["valid_length"]
+                current_blocks = metadata["blocks_per_allocation"]
+                if blocks_per_allocation not in (0, current_blocks):
+                    raise RuntimeError("mixed private SWA layouts in one batch")
+                blocks_per_allocation = current_blocks
+                current_allocations = metadata["num_allocations"]
+                current_num_blocks = metadata["private_num_blocks"]
+                if num_allocations not in (0, current_allocations):
+                    raise RuntimeError("mixed private SWA pool sizes in one batch")
+                if private_num_blocks not in (0, current_num_blocks):
+                    raise RuntimeError("mixed private SWA block counts in one batch")
+                num_allocations = current_allocations
+                private_num_blocks = current_num_blocks
+            if blocks_per_allocation:
+                if np.any(allocations < 0):
+                    missing = [self.input_batch.req_ids[i]
+                               for i in np.flatnonzero(allocations < 0)]
+                    raise RuntimeError(
+                        f"missing private SWA allocation metadata for {missing}")
+                self.input_batch.block_table.set_private_swa_allocations(
+                    allocations,
+                    blocks_per_allocation,
+                    num_allocations,
+                    private_num_blocks,
+                    window_starts,
+                    valid_lengths,
+                )
+        return callback
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
@@ -880,6 +963,73 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
+        # Scheduler accounting remains [H, P). Only the model execution view
+        # is expanded to [R, P) for a one-shot prefix-hit SWA warm-up.
+        compute_starts = self.input_batch.num_computed_tokens_cpu[
+            :num_reqs
+        ].copy()
+        rollback_lengths = np.zeros(num_reqs, dtype=np.int32)
+        persistent_starts = np.full(num_reqs, -1, dtype=np.int64)
+        metadata_by_req = getattr(self, "_private_swa_metadata_by_req", {})
+        if envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL:
+            for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                item = metadata_by_req.get(req_id)
+                if item is None:
+                    continue
+                shared_cache_length = int(
+                    item.get("shared_cache_length", compute_starts[row])
+                )
+                swa_compute_start = int(
+                    item.get("swa_compute_start", shared_cache_length)
+                )
+                if shared_cache_length != int(compute_starts[row]):
+                    raise RuntimeError(
+                        "private SWA shared-cache length is inconsistent with "
+                        f"runner state for {req_id}: {shared_cache_length} != "
+                        f"{int(compute_starts[row])}"
+                    )
+                if not 0 <= swa_compute_start <= shared_cache_length:
+                    raise ValueError(
+                        f"invalid private SWA compute interval for {req_id}: "
+                        f"[{swa_compute_start}, {shared_cache_length})"
+                    )
+                rollback_length = shared_cache_length - swa_compute_start
+                metadata_window_size = int(
+                    item.get("window_size", self._private_swa_window_size)
+                )
+                if rollback_length > metadata_window_size:
+                    raise ValueError(
+                        f"private SWA rollback for {req_id} exceeds configured "
+                        f"window: {rollback_length} > {metadata_window_size}"
+                    )
+                if rollback_length == 0:
+                    continue
+                rollback_lengths[row] = rollback_length
+                persistent_starts[row] = shared_cache_length
+                compute_starts[row] = swa_compute_start
+
+        num_scheduled_tokens += rollback_lengths
+        total_num_scheduled_tokens = int(num_scheduled_tokens.sum())
+        if total_num_scheduled_tokens > self.input_ids.cpu.shape[0]:
+            raise RuntimeError(
+                "private SWA rollback exceeds runner token-buffer capacity: "
+                f"{total_num_scheduled_tokens} > {self.input_ids.cpu.shape[0]}"
+            )
+        has_private_swa_rollback = bool(np.any(rollback_lengths))
+        self._private_swa_compute_starts_np = compute_starts
+        self._private_swa_rollback_lengths_np = rollback_lengths
+        self._private_swa_has_rollback = has_private_swa_rollback
+        compute_starts_cpu = getattr(
+            self, "_private_swa_compute_starts_cpu", None
+        )
+        if compute_starts_cpu is None:
+            compute_starts_cpu = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device="cpu"
+            )
+            self._private_swa_compute_starts_cpu = compute_starts_cpu
+        compute_starts_cpu[:num_reqs].copy_(torch.from_numpy(compute_starts))
+        compute_starts_cpu[num_reqs:].fill_(0)
+
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
@@ -893,8 +1043,11 @@ class NPUModelRunner(GPUModelRunner):
             num_valid_tokens = np.array(
                 [
                     scheduler_output.num_scheduled_tokens[i]
-                    - len(scheduler_output.scheduled_spec_decode_tokens.get(i, []))
-                    for i in self.input_batch.req_ids
+                    - len(
+                        scheduler_output.scheduled_spec_decode_tokens.get(i, [])
+                    )
+                    + rollback_lengths[row]
+                    for row, i in enumerate(self.input_batch.req_ids)
                 ],
                 dtype=np.int32,
             )
@@ -910,7 +1063,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         positions_np = self._positions_np_buf[:total_num_scheduled_tokens]
         np.add(
-            self.input_batch.num_computed_tokens_cpu[req_indices],
+            compute_starts[req_indices],
             self.query_pos.np[: cu_num_tokens[-1]],
             out=positions_np,
         )
@@ -933,12 +1086,18 @@ class NPUModelRunner(GPUModelRunner):
                 pre_pcp_qsl,
                 pre_pcp_positions,
             )
+            if has_private_swa_rollback:
+                self.input_batch.block_table.mask_shared_slots_for_private_swa_rollback(
+                    pre_pcp_positions,
+                    torch.from_numpy(req_indices).to(self.device),
+                    torch.from_numpy(persistent_starts).to(self.device),
+                )
 
         if self.use_cp:
             self.pcp_manager.init_batch_info(
                 num_scheduled_tokens,
                 self.input_batch.num_reqs,
-                self.input_batch.num_computed_tokens_cpu,
+                compute_starts,
                 self.input_batch.num_prompt_tokens,
             )
 
@@ -982,7 +1141,7 @@ class NPUModelRunner(GPUModelRunner):
             cu_num_tokens = self._get_cumsum_and_arange(num_scheduled_tokens, self.query_pos.np)
             positions_np = self._positions_np_buf[:total_num_scheduled_tokens]
             np.add(
-                self.input_batch.num_computed_tokens_cpu[req_indices],
+                compute_starts[req_indices],
                 position_pcp[:total_num_scheduled_tokens],
                 out=positions_np,
             )
@@ -1044,7 +1203,7 @@ class NPUModelRunner(GPUModelRunner):
                         dst_slice=dst_slice,
                     )
                 else:
-                    start_pos = self.input_batch.num_computed_tokens_cpu[req_idx]
+                    start_pos = compute_starts[req_idx]
 
                     # Skip if trying to read beyond available embeddings
                     if start_pos >= req_embeds.shape[0]:
@@ -1083,7 +1242,7 @@ class NPUModelRunner(GPUModelRunner):
         # _build_attention_metadata (max_seq_len) and discard_request_mask.
         # seq_lens (GPU) will be computed later using the same optimistic values.
         torch.add(
-            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+            torch.from_numpy(compute_starts),
             torch.from_numpy(num_scheduled_tokens),
             out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
@@ -1165,7 +1324,7 @@ class NPUModelRunner(GPUModelRunner):
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
         valid_sampled_token_count_gpu = self.valid_sampled_token_count_gpu
         if self.use_async_spec_decode:
-            computed_token_tensor_cpu = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
+            computed_token_tensor_cpu = torch.from_numpy(compute_starts).to(
                 device=self.device, non_blocking=True
             )
         if (
@@ -1186,7 +1345,7 @@ class NPUModelRunner(GPUModelRunner):
             )
         else:
             self.num_computed_tokens[:num_reqs].copy_(
-                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+                torch.from_numpy(compute_starts),
                 non_blocking=True,
             )
 
@@ -1285,6 +1444,12 @@ class NPUModelRunner(GPUModelRunner):
                 self.query_start_loc.gpu[: num_reqs + 1],
                 self.positions[:total_num_scheduled_tokens],
             )
+            if has_private_swa_rollback:
+                self.input_batch.block_table.mask_shared_slots_for_private_swa_rollback(
+                    self.positions[:total_num_scheduled_tokens],
+                    req_indices_gpu,
+                    torch.from_numpy(persistent_starts).to(self.device),
+                )
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
             drift = self.num_computed_tokens[req_indices_gpu].to(
@@ -1980,11 +2145,22 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_tokens_copy = (
                 scheduler_output.scheduled_spec_decode_tokens.copy()
             )
+            # dataclasses.replace() only copies declared dataclass fields and
+            # silently drops dynamic attributes. Capture the private SWA
+            # metadata (set by the scheduler-side patch) before replace and
+            # re-attach it afterwards, otherwise the runner skips
+            # set_private_swa_allocations() and computes ring slots with
+            # stale/-1 allocation handles.
+            private_swa_metadata_copy = getattr(
+                scheduler_output, "private_swa_metadata", None
+            )
             scheduler_output = replace(
                 scheduler_output,
                 num_scheduled_tokens=num_scheduled_tokens_copy,
                 scheduled_spec_decode_tokens=spec_decode_tokens_copy,
             )
+            if private_swa_metadata_copy is not None:
+                scheduler_output.private_swa_metadata = private_swa_metadata_copy
 
         self._start_dump_data()
         # self._draft_token_ids is None when `input_fits_in_drafter=False`
@@ -2089,7 +2265,6 @@ class NPUModelRunner(GPUModelRunner):
                         return EMPTY_MODEL_RUNNER_OUTPUT
                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
-                max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -2098,13 +2273,20 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output,
                     num_scheduled_tokens_np,
                 )
+                max_num_scheduled_tokens = int(
+                    num_scheduled_tokens_np.max()
+                )
 
-                num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+                num_tokens_unpadded = total_num_scheduled_tokens
                 if self.pcp_size > 1:
                     num_tokens_unpadded = self.pcp_manager.total_num_sampled_tokens_pcp
                 cascade_attn_prefix_lens = None
                 # Disable cascade attention when using microbatching (DBO)
-                if self.cascade_attn_enabled and not self.parallel_config.enable_dbo:
+                if (
+                    self.cascade_attn_enabled
+                    and not self.parallel_config.enable_dbo
+                    and not self._private_swa_has_rollback
+                ):
                     # Pre-compute cascade attention prefix lengths
                     cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
                         num_scheduled_tokens_np,
@@ -2124,7 +2306,10 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
-                    force_eager=self.model_config.enforce_eager,
+                    force_eager=(
+                        self.model_config.enforce_eager
+                        or self._private_swa_has_rollback
+                    ),
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
 
@@ -2201,7 +2386,7 @@ class NPUModelRunner(GPUModelRunner):
                     req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens_np)
                     dsa_positions_np = self._dsa_positions_np_buf[:total_num_scheduled_tokens]
                     np.add(
-                        self.input_batch.num_computed_tokens_cpu[req_indices],
+                        self._private_swa_compute_starts_np[req_indices],
                         self.query_pos.np[:total_num_scheduled_tokens],
                         out=dsa_positions_np,
                     )
@@ -2300,7 +2485,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens_across_dp=num_tokens_across_dp,
                 aclgraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
-                num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                num_actual_tokens=total_num_scheduled_tokens,
                 model_instance=self.model,
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
@@ -3144,9 +3329,11 @@ class NPUModelRunner(GPUModelRunner):
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
         self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
-        num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
-            :num_reqs_padded
-        ]
+        num_computed_tokens_cpu = getattr(
+            self,
+            "_private_swa_compute_starts_cpu",
+            self.input_batch.num_computed_tokens_cpu_tensor,
+        )[:num_reqs_padded]
         num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens_cpu_tensor[
             :num_reqs_padded
         ]
@@ -3189,6 +3376,24 @@ class NPUModelRunner(GPUModelRunner):
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
         )
+
+        if envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL:
+            rollback_start = torch.zeros(num_reqs_padded, dtype=torch.int32, device=self.device)
+            persistent_start = torch.full((num_reqs_padded,), -1, dtype=torch.int32, device=self.device)
+            metadata_by_req = getattr(self, "_private_swa_metadata_by_req", {})
+            for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                item = metadata_by_req.get(req_id)
+                if item is not None:
+                    rollback_start[row] = int(item.get("effective_compute_start", 0))
+                    original_hit = item.get("original_prefix_hit_length")
+                    # -1 marks ordinary chunks/no prefix hit. Only a real
+                    # positive prefix hit switches compressor/indexer start_pos
+                    # to H; ordinary requests retain the normal start_pos.
+                    persistent_start[row] = (
+                        int(original_hit) if original_hit is not None and int(original_hit) > 0 else -1
+                    )
+            cm_base.private_swa_rollback_start = rollback_start
+            cm_base.private_swa_persistent_start = persistent_start
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
@@ -4384,9 +4589,21 @@ class NPUModelRunner(GPUModelRunner):
                     kv_tensor = kv_cache_raw_tensors[layer_name]
                     sum_page_size_bytes = kv_tensor.numel()
                     num_blocks = sum_page_size_bytes // current_kv_cache_spec.page_size_bytes
-                    assert num_blocks == kv_cache_config.num_blocks, \
-                        f"num_blocks: {num_blocks} should be equal to " \
-                        f"kv_cache_config.num_blocks: {kv_cache_config.num_blocks}"
+                    is_private_swa = (
+                        envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL
+                        and isinstance(current_kv_cache_spec, AscendSlidingWindowMLASpec)
+                        and getattr(current_kv_cache_spec, "model_version", None)
+                        == "deepseek_v4"
+                    )
+                    if is_private_swa:
+                        if num_blocks <= 0:
+                            raise RuntimeError(
+                                "DeepSeek-V4 private SWA KV cache has no physical blocks"
+                            )
+                    else:
+                        assert num_blocks == kv_cache_config.num_blocks, \
+                            f"num_blocks: {num_blocks} should be equal to " \
+                            f"kv_cache_config.num_blocks: {kv_cache_config.num_blocks}"
                     kv_cache_shape = self.attn_backend.get_kv_cache_shape(
                         num_blocks, current_kv_cache_spec.block_size,
                         current_kv_cache_spec.num_kv_heads,
@@ -4556,7 +4773,34 @@ class NPUModelRunner(GPUModelRunner):
                     # different memory capacities, `num_blocks` can be different on
                     # different GPUs, and `kv_cache_config.num_blocks` is set to
                     # the min of all `num_blocks`. Verify it here.
-                    assert num_blocks >= kv_cache_config.num_blocks
+                    is_private_swa = (
+                        envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL
+                        and getattr(
+                            current_kv_cache_spec, "model_version", None
+                        ) == "deepseek_v4"
+                        and hasattr(
+                            current_kv_cache_spec, "sliding_window"
+                        )
+                    )
+                    if is_private_swa:
+                        draft_tokens = (
+                            getattr(
+                                self.vllm_config.speculative_config,
+                                "num_speculative_tokens",
+                                0,
+                            )
+                            if self.vllm_config.speculative_config is not None
+                            else 0
+                        )
+                        private_config = PrivateSWAConfig(
+                            block_size=current_kv_cache_spec.block_size,
+                            window_size=current_kv_cache_spec.sliding_window,
+                            in_flight_tokens=1 + draft_tokens,
+                            max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
+                        )
+                        assert num_blocks == private_config.num_blocks
+                    else:
+                        assert num_blocks >= kv_cache_config.num_blocks
 
                     if hasattr(attn_backend, "get_supported_kernel_block_sizes") and self.use_hybrid_blocks:
                         block_size = attn_backend.get_supported_kernel_block_sizes()[0]
@@ -4794,7 +5038,7 @@ class NPUModelRunner(GPUModelRunner):
             self.input_batch = NPUInputBatch(
                 max_num_reqs=self.max_num_reqs,
                 max_model_len=max_model_len,
-                max_num_batched_tokens=self.max_num_tokens,
+                max_num_batched_tokens=self._max_input_batch_tokens,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 vocab_size=self.model_config.get_vocab_size(),

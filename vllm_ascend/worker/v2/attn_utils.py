@@ -38,14 +38,49 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend import envs
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, AscendPrefillContextParallelMetadata
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.core.private_swa_pool import (
+    PrivateSWAConfig,
+    is_private_swa_kv_cache_spec,
+)
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import calc_split_factor
 
 _ATTENTION_MASK_BUILDER = None
+
+
+def _validate_kv_cache_num_blocks(
+    num_blocks: int,
+    kv_cache_config: KVCacheConfig,
+    kv_cache_spec: AttentionSpec,
+    vllm_config: VllmConfig,
+) -> None:
+    """Validate shared and private SWA cache capacities independently."""
+    if (
+        envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL
+        and is_private_swa_kv_cache_spec(kv_cache_spec)
+    ):
+        draft_tokens = (
+            getattr(vllm_config.speculative_config, "num_speculative_tokens", 0)
+            if vllm_config.speculative_config is not None
+            else 0
+        )
+        private_config = PrivateSWAConfig(
+            block_size=kv_cache_spec.block_size,
+            window_size=kv_cache_spec.sliding_window,
+            in_flight_tokens=1 + draft_tokens,
+            max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+        )
+        assert num_blocks == private_config.num_blocks, (
+            "private SWA tensor size does not match its fixed ring layout: "
+            f"{num_blocks} != {private_config.num_blocks}"
+        )
+        return
+    assert num_blocks >= kv_cache_config.num_blocks
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
@@ -375,7 +410,9 @@ def _reshape_kv_cache(
                 # different memory capacities, `num_blocks` can be different on
                 # different GPUs, and `kv_cache_config.num_blocks` is set to
                 # the min of all `num_blocks`. Verify it here.
-                assert num_blocks >= kv_cache_config.num_blocks
+                _validate_kv_cache_num_blocks(
+                    num_blocks, kv_cache_config, kv_cache_spec, vllm_config
+                )
 
                 attn_backend = attn_backends[layer_name]
                 if kv_cache_group_id < len(kernel_block_sizes):

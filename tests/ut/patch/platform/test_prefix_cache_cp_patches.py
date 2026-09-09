@@ -27,9 +27,12 @@ from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
+    _PRIVATE_SWA_TENSOR_ATTR,
+    _append_private_swa_tensors,
     _ascend_resolve_kv_cache_block_sizes,
 )
 from vllm_ascend.patch.platform.patch_mamba_manager import AscendMambaManager
+from vllm_ascend.worker.v2.attn_utils import _validate_kv_cache_num_blocks
 
 
 def _make_hybrid_kv_cache_config(
@@ -447,6 +450,74 @@ def test_deepseek_v4_detection_handles_non_mapping_nested_specs() -> None:
     assert not _is_deepseek_v4_kv_cache_spec(unknown_spec)
 
 
+def test_get_num_blocks_to_allocate_matches_upstream_interface() -> None:
+    coordinator = AscendHybridKVCacheCoordinator.__new__(
+        AscendHybridKVCacheCoordinator
+    )
+    manager = MagicMock()
+    manager.get_num_blocks_to_allocate.return_value = 3
+    coordinator.single_type_managers = (manager,)
+    coordinator.private_swa_group_ids = set()
+    computed_blocks = ([MagicMock()],)
+
+    result = coordinator.get_num_blocks_to_allocate(
+        request_id="request-0",
+        num_tokens=12,
+        new_computed_blocks=computed_blocks,
+        num_encoder_tokens=0,
+        total_computed_tokens=8,
+        num_tokens_main_model=10,
+        apply_admission_cap=True,
+    )
+
+    assert result == 3
+    manager.get_num_blocks_to_allocate.assert_called_once_with(
+        "request-0",
+        12,
+        computed_blocks[0],
+        8,
+        10,
+        apply_admission_cap=True,
+    )
+
+
+def test_remove_skipped_blocks_matches_upstream_interface() -> None:
+    coordinator = AscendHybridKVCacheCoordinator.__new__(
+        AscendHybridKVCacheCoordinator
+    )
+    manager = MagicMock()
+    coordinator.single_type_managers = (manager,)
+    coordinator.private_swa_group_ids = set()
+
+    coordinator.remove_skipped_blocks("request-0", 8)
+
+    manager.remove_skipped_blocks.assert_called_once_with("request-0", 8)
+
+
+def test_allocate_new_computed_blocks_uses_upstream_manager_interface() -> None:
+    """Shared groups use the single upstream API for local and external KV."""
+    coordinator = AscendHybridKVCacheCoordinator.__new__(
+        AscendHybridKVCacheCoordinator
+    )
+    shared_manager = MagicMock()
+    private_swa_manager = MagicMock()
+    coordinator.single_type_managers = (shared_manager, private_swa_manager)
+    coordinator.private_swa_group_ids = {1}
+    shared_blocks = [MagicMock()]
+    private_blocks = [MagicMock()]
+
+    coordinator.allocate_new_computed_blocks(
+        "request-0",
+        (shared_blocks, private_blocks),
+        num_local_computed_tokens=128,
+        num_external_computed_tokens=64,
+    )
+
+    shared_manager.allocate_new_computed_blocks.assert_called_once_with(
+        "request-0", shared_blocks, 128, 64
+    )
+    private_swa_manager.allocate_new_computed_blocks.assert_not_called()
+
 def test_ascend_mamba_manager_uses_logical_block_size_with_prefix_caching() -> None:
     mamba_spec = MambaSpec(
         block_size=16,
@@ -474,6 +545,83 @@ def test_ascend_mamba_manager_uses_logical_block_size_with_prefix_caching() -> N
     manager = AscendMambaManager(**manager_kwargs)
 
     assert manager.block_size == mamba_spec.block_size
+
+
+def test_private_swa_tensors_are_appended_after_shared_rank_alignment() -> None:
+    shared_spec = MLAAttentionSpec(
+        block_size=32,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=4,
+        model_version="deepseek_v4",
+    )
+    private_spec = SlidingWindowMLASpec(
+        block_size=32,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        sliding_window=128,
+        compress_ratio=1,
+        model_version="deepseek_v4",
+    )
+    shared_group = UniformTypeKVCacheSpecs.from_specs({"shared": shared_spec})
+    private_group = UniformTypeKVCacheSpecs.from_specs({"private": private_spec})
+    assert shared_group is not None
+    assert private_group is not None
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[
+            KVCacheTensor(size=shared_spec.page_size_bytes * 8, shared_by=["shared"]),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=["shared"], kv_cache_spec=shared_group),
+            KVCacheGroupSpec(layer_names=["private"], kv_cache_spec=private_group),
+        ],
+    )
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=2),
+        speculative_config=None,
+    )
+
+    _append_private_swa_tensors(vllm_config, kv_cache_config)
+
+    private_tensor = next(
+        tensor for tensor in kv_cache_config.kv_cache_tensors
+        if tensor.shared_by == ["private"]
+    )
+    # W=128, B=32, no speculation: 2 × max_num_seqs allocations × 4 blocks + null block.
+    assert private_tensor.size == private_spec.page_size_bytes * 17
+    assert getattr(private_tensor, _PRIVATE_SWA_TENSOR_ATTR) is True
+    # The shared count is unchanged and a repeated post-alignment call is idempotent.
+    assert kv_cache_config.num_blocks == 8
+    _append_private_swa_tensors(vllm_config, kv_cache_config)
+    assert len([t for t in kv_cache_config.kv_cache_tensors if t.shared_by == ["private"]]) == 1
+
+
+def test_private_swa_worker_accepts_fixed_ring_capacity(monkeypatch) -> None:
+    private_spec = SlidingWindowMLASpec(
+        block_size=32,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        sliding_window=128,
+        compress_ratio=1,
+        model_version="deepseek_v4",
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.attn_utils.envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL",
+        True,
+    )
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=2),
+        speculative_config=None,
+    )
+    kv_cache_config = SimpleNamespace(num_blocks=8)
+
+    _validate_kv_cache_num_blocks(17, kv_cache_config, private_spec, vllm_config)
+    with pytest.raises(AssertionError, match="fixed ring layout"):
+        _validate_kv_cache_num_blocks(8, kv_cache_config, private_spec, vllm_config)
 
 
 def test_swa_reachable_block_mask_sparse_with_lcm_alignment() -> None:

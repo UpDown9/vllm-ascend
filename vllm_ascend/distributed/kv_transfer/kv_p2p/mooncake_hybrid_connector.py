@@ -49,9 +49,16 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.core.private_swa_pool import (
+    PRIVATE_SWA_TRANSFER_FAILED,
+    PRIVATE_SWA_TRANSFER_READY,
+    PRIVATE_SWA_TRANSFER_RECEIVING,
+)
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import get_transfer_timeout_value
 from vllm_ascend.utils import enable_custom_op, is_vl_model
@@ -66,6 +73,13 @@ if TYPE_CHECKING:
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
+
+
+def _canonical_private_layouts(layouts: dict[Any, dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    """Normalize group-id keys for msgpack int/string differences."""
+    if not layouts:
+        return {}
+    return {str(group_id): dict(layout) for group_id, layout in layouts.items()}
 
 
 # A busy peer can otherwise keep a global executor worker forever when the
@@ -88,6 +102,10 @@ class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     block_lens: list[int]
     ssm_sizes: tuple[int, int]
     local_ip: str = ""
+    layout_version: int = 1
+    block_strides: list[int] | None = None
+    addr_group_idx: list[list[int]] | None = None
+    private_swa_layouts: dict[str, dict[str, Any]] | None = None
 
 
 @dataclass
@@ -102,6 +120,7 @@ class ReqMeta:
     remote_ptp_size: int | None
     remote_multi_nodes_meta_mapping: dict[str, dict[str, Any]]
     num_prompt_blocks: int
+    private_swa_layout: dict[str, Any] | None = None
 
 
 @dataclass
@@ -384,6 +403,7 @@ class KVCacheRecvingThread(threading.Thread):
         vllm_config: VllmConfig,
         kv_cache_config: KVCacheConfig,
         kv_caches: dict[str, Any],
+        private_swa_group_layouts: dict[str, dict[str, Any]],
         prefill_pp_layer_partition: str | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingThread")
@@ -403,6 +423,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.block_stride_per_addr = block_stride_per_addr
         self.addr_group_idx = addr_group_idx
         self.hma_group_size = hma_group_size
+        self.private_swa_group_layouts = private_swa_group_layouts
         self.mamba_ssm_size = mamba_ssm_size
         self.remote_te_port: dict[str, dict[int, int]] = SizedDict()
         self.remote_metadata_lock = threading.Lock()
@@ -465,6 +486,9 @@ class KVCacheRecvingThread(threading.Thread):
                 self.num_kv_heads = max(self.model_config.hf_text_config.num_key_value_heads // self.tp_size, 1)
         self.proc_not_transfer_request: dict[str, bool] = {}
         self.proc_not_transfer_request_lock = threading.Lock()
+        self.failed_recv_requests: set[str] = set()
+        self.invalid_block_ids: set[int] = set()
+        self.failed_recv_requests_lock = threading.Lock()
 
     def add_request(
         self,
@@ -507,6 +531,52 @@ class KVCacheRecvingThread(threading.Thread):
             A set of request IDs that have been completed.
         """
         return self.task_tracker.get_and_clear_finished_requests()
+
+    def get_and_clear_invalid_block_ids(self) -> set[int]:
+        """Get and clear scheduler-visible block IDs that failed to load."""
+        with self.failed_recv_requests_lock:
+            invalid_block_ids = self.invalid_block_ids
+            self.invalid_block_ids = set()
+        return invalid_block_ids
+
+    def _is_failed_recv_request(self, request_id: str) -> bool:
+        with self.failed_recv_requests_lock:
+            return request_id in self.failed_recv_requests
+
+    def _transfer_match_block_ids(self, local_block_ids: BlockIds) -> list[int]:
+        """Select one shared group for mapping a failed pull to its request.
+
+        Block IDs are group-local. Reporting IDs from every hybrid group can
+        therefore falsely match another request. The scheduler records the
+        same first non-private group when it starts the pull.
+        """
+        private_group_ids = {
+            int(group_id) for group_id in self.private_swa_group_layouts
+        }
+        for group_id, group_block_ids in enumerate(local_block_ids):
+            if group_id not in private_group_ids and group_block_ids:
+                return group_block_ids
+        return next(
+            (
+                group_block_ids
+                for group_block_ids in local_block_ids
+                if group_block_ids
+            ),
+            [],
+        )
+
+    def _mark_failed_recv_request(
+        self, request_id: str, local_block_ids: BlockIds
+    ) -> None:
+        with self.failed_recv_requests_lock:
+            self.failed_recv_requests.add(request_id)
+            self.invalid_block_ids.update(
+                self._transfer_match_block_ids(local_block_ids)
+            )
+
+    def _clear_failed_recv_request(self, request_id: str) -> None:
+        with self.failed_recv_requests_lock:
+            self.failed_recv_requests.discard(request_id)
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -598,28 +668,64 @@ class KVCacheRecvingThread(threading.Thread):
         remote_handshake_port = req_meta["remote_handshake_port"]
         remote_port_send_num = req_meta["remote_port_send_num"]
         all_task_done = req_meta["all_task_done"]
+        transfer_failed = self._is_failed_recv_request(request_id)
 
         try:
-            logger.debug("Starting to transfer KV cache for request %s.", remote_request_id)
-            if not self.use_hybrid:
-                self._transfer_kv_cache(req_meta)
+            if transfer_failed:
+                self._mark_failed_recv_request(
+                    request_id, req_meta["local_block_ids"]
+                )
+                logger.warning(
+                    "Skipping KV cache transfer after an earlier pull failed "
+                    "for request %s.",
+                    remote_request_id,
+                )
             else:
-                self._transfer_kv_cache_all_groups(req_meta)
-            logger.debug("Finished transferring KV cache for request %s.", remote_request_id)
-        except Exception:
-            logger.exception("Failed to transfer KV cache for request %s.", remote_request_id)
+                try:
+                    logger.debug(
+                        "Starting to transfer KV cache for request %s.",
+                        remote_request_id,
+                    )
+                    if not self.use_hybrid:
+                        self._transfer_kv_cache(req_meta)
+                    else:
+                        self._transfer_kv_cache_all_groups(req_meta)
+                    logger.debug(
+                        "Finished transferring KV cache for request %s.",
+                        remote_request_id,
+                    )
+                except Exception as error:
+                    transfer_failed = True
+                    self._mark_failed_recv_request(
+                        request_id, req_meta["local_block_ids"]
+                    )
+                    logger.exception(
+                        "Failed to transfer KV cache for request %s: %s",
+                        remote_request_id,
+                        error,
+                    )
         finally:
-            self._send_done_signal_to_free_remote_port(remote_request_id, remote_host, remote_port_send_num)
-            if self._mark_request_task_done(request_id, all_task_done):
-                if len(req_meta["local_block_ids"]) > 0:
-                    self.task_tracker.update_done_task_count(request_id)
+            all_tasks_done = self._mark_request_task_done(
+                request_id, all_task_done
+            )
+            if all_tasks_done:
+                self.task_tracker.update_done_task_count(request_id)
                 with self.proc_not_transfer_request_lock:
                     self.proc_not_transfer_request.pop(remote_request_id, None)
+                self._clear_failed_recv_request(request_id)
             self.request_queue.task_done()
+            self._send_done_signal_to_free_remote_port(
+                remote_request_id, remote_host, remote_port_send_num
+            )
             # Always send the done signal to the remote host to ensure proper
             # resource cleanup. Failing to do so may cause a memory leak on the
             # remote host.
-            self._send_done_recv_signal(remote_request_id, remote_host, remote_handshake_port, remote_port_send_num)
+            self._send_done_recv_signal(
+                remote_request_id,
+                remote_host,
+                remote_handshake_port,
+                remote_port_send_num,
+            )
 
     def _send_done_signal_to_free_remote_port(
         self, request_id: str, remote_host: str, remote_port_send_num: dict[int, RemotePortInfo]
@@ -961,6 +1067,28 @@ class KVCacheRecvingThread(threading.Thread):
             ensure_zmq_send(sock, self.encoder.encode((GET_META_MSG, "")), f"{remote_host}:{remote_handshake_port}")
             metadata_bytes = ensure_zmq_recv(sock, f"{remote_host}:{remote_handshake_port}")
             agent_meta = self.decoder.decode(metadata_bytes)
+            if self.private_swa_group_layouts:
+                if agent_meta.layout_version != 1:
+                    raise RuntimeError(
+                        f"unsupported Mooncake private SWA layout version: {agent_meta.layout_version}")
+                if _canonical_private_layouts(agent_meta.private_swa_layouts) != _canonical_private_layouts(self.private_swa_group_layouts):
+                    raise RuntimeError(
+                        "Mooncake P/D private SWA cache layouts differ: "
+                        f"remote={agent_meta.private_swa_layouts}, "
+                        f"local={self.private_swa_group_layouts}")
+                if agent_meta.block_strides != self.block_stride_per_addr:
+                    raise RuntimeError(
+                        "Mooncake P/D KV cache block strides differ: "
+                        f"remote={agent_meta.block_strides}, "
+                        f"local={self.block_stride_per_addr}")
+                if agent_meta.addr_group_idx != self.addr_group_idx:
+                    raise RuntimeError(
+                        "Mooncake P/D KV cache group/address layouts differ: "
+                        f"remote={agent_meta.addr_group_idx}, local={self.addr_group_idx}")
+                if agent_meta.block_lens != self.block_len_per_addr:
+                    raise RuntimeError(
+                        "Mooncake P/D KV cache block lengths differ: "
+                        f"remote={agent_meta.block_lens}, local={self.block_len_per_addr}")
             engine_id = agent_meta.engine_id
             assert engine_id != self.local_engine_id, (
                 f"Conflict engine id {engine_id} with local engine id {self.local_engine_id}."
@@ -1073,6 +1201,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             remote_ptp_size=kv_transfer_params.get("remote_ptp_size"),
             remote_multi_nodes_meta_mapping=kv_transfer_params.get("remote_multi_nodes_meta_mapping", {}),
             num_prompt_blocks=kv_transfer_params.get("num_prompt_blocks", 0),
+            private_swa_layout=kv_transfer_params.get("private_swa_layout"),
         )
 
 
@@ -1101,7 +1230,15 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         assert self.connector_scheduler is not None
-        return self.connector_scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
+        return self.connector_scheduler.update_state_after_alloc(
+            request, blocks, num_external_tokens
+        )
+
+    def update_connector_output(
+        self, connector_output: KVConnectorOutput
+    ) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.update_connector_output(connector_output)
 
     def build_connector_meta(
         self,
@@ -1129,6 +1266,11 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """Get scheduler-visible block IDs whose KV load failed."""
+        assert self.connector_worker is not None
+        return self.connector_worker.get_block_ids_with_load_errors()
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
@@ -1208,6 +1350,7 @@ class MooncakeConnectorScheduler:
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[str, tuple[Request, BlockIds, int]] = {}
+        self._private_swa_receiving_requests: dict[str, Request] = {}
         self._reqs_need_send: dict[str, float] = {}
         self._reqs_in_batch: set[str] = set()
 
@@ -1259,6 +1402,88 @@ class MooncakeConnectorScheduler:
         self.num_swa_blocks = [
             cdiv(n_tokens, block_size) + 1 if n_tokens else 0 for n_tokens, block_size in sw_sizes_tokens
         ]
+        self.private_swa_group_ids: set[int] = set()
+        self.private_swa_group_layouts: dict[int, dict[str, Any]] = {}
+        speculative_config = vllm_config.speculative_config
+        draft_tokens = (getattr(speculative_config, "num_speculative_tokens", 0)
+                        if speculative_config is not None else 0)
+        for group_id, specs in enumerate(self.kv_cache_specs):
+            if not ascend_envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL:
+                continue
+            private_spec = next((spec for spec in specs
+                                 if isinstance(spec, SlidingWindowSpec)
+                                 and getattr(spec, "model_version", None) == "deepseek_v4"), None)
+            if private_spec is None:
+                continue
+            block_size = int(private_spec.block_size)
+            window = int(private_spec.sliding_window)
+            capacity = window - 1 + 1 + draft_tokens
+            blocks_per_allocation = ((capacity + block_size - 1)
+                                     // block_size)
+            self.private_swa_group_ids.add(group_id)
+            self.private_swa_group_layouts[group_id] = {
+                "layout_version": 1,
+                "pool_type": "private",
+                "physical_block_size": block_size,
+                "window_size": window,
+                "in_flight_tokens": 1 + draft_tokens,
+                "blocks_per_allocation": blocks_per_allocation,
+            }
+
+    @staticmethod
+    def _private_page_ids(allocation: int, layout: dict[str, Any]) -> list[int]:
+        block_size = int(layout["physical_block_size"])
+        pages = int(layout["blocks_per_allocation"])
+        start = int(layout["window_start"])
+        end = int(layout["valid_length"])
+        if allocation < 0 or start < 0 or end < start:
+            raise RuntimeError(f"invalid private SWA request layout: {layout}")
+        if end == start:
+            return []
+        first = start // block_size
+        last = (end - 1) // block_size
+        base = 1 + allocation * pages
+        return [base + logical % pages for logical in range(first, last + 1)]
+
+    def _validate_private_layout(self, layout: dict[str, Any]) -> None:
+        group_id = int(layout.get("group_id", -1))
+        expected = self.private_swa_group_layouts.get(group_id)
+        if expected is None:
+            raise RuntimeError(f"remote private SWA group {group_id} is not configured locally")
+        for field, value in expected.items():
+            if layout.get(field) != value:
+                raise RuntimeError(
+                    f"private SWA P/D layout mismatch for group {group_id}: "
+                    f"{field}: remote={layout.get(field)!r}, local={value!r}")
+        required = ("allocation_handle", "confirmed_length", "valid_length",
+                    "window_start", "first_page_offset",
+                    "last_page_valid_length", "page_order")
+        missing = [field for field in required if field not in layout]
+        if missing:
+            raise RuntimeError(f"private SWA P/D metadata missing fields: {missing}")
+        expected_pages = self._private_page_ids(
+            int(layout["allocation_handle"]), layout
+        )
+        block_size = int(layout["physical_block_size"])
+        blocks_per_allocation = int(layout["blocks_per_allocation"])
+        span = int(layout["valid_length"]) - int(layout["window_start"])
+        capacity = blocks_per_allocation * block_size
+        # A non-aligned [window_start, valid_length) interval may cover one
+        # more logical page than the number of physical ring blocks. The
+        # extra page aliases the first physical block; it is not an
+        # over-allocation. Validate token capacity instead of page count.
+        if span < 0 or span > capacity:
+            raise RuntimeError(
+                "private SWA transfer span exceeds one allocation: "
+                f"{span} > {capacity}"
+            )
+        if list(layout["page_order"]) != expected_pages:
+            raise RuntimeError("private SWA remote page order is inconsistent with its layout")
+        if int(layout.get("first_page_offset", -1)) != int(layout["window_start"]) % block_size:
+            raise RuntimeError("private SWA first partial-page metadata is invalid")
+        expected_last = (int(layout["valid_length"]) % block_size or block_size)
+        if int(layout.get("last_page_valid_length", -1)) != expected_last:
+            raise RuntimeError("private SWA last partial-page metadata is invalid")
 
     def get_sw_clipped_blocks(self, block_ids: BlockIds) -> BlockIds:
         """
@@ -1378,6 +1603,84 @@ class MooncakeConnectorScheduler:
             if params.get("remote_block_ids"):
                 if all(p in params for p in ("remote_engine_id", "remote_host", "remote_port", "remote_request_id")):
                     local_block_ids = blocks.get_unhashed_block_ids_all_groups() if num_external_tokens > 0 else []
+                    private_layout = params.get("private_swa_layout")
+                    if self.private_swa_group_ids and num_external_tokens > 0:
+                        if private_layout is None:
+                            raise RuntimeError("remote DeepSeek-V4 request has no private SWA layout")
+                        self._validate_private_layout(private_layout)
+                        allocation = getattr(request, "private_swa_allocation", None)
+                        if allocation is None:
+                            raise RuntimeError("decode request has no private SWA allocation")
+                        local_layout = dict(private_layout)
+                        local_layout["allocation_handle"] = int(allocation)
+                        local_pages = self._private_page_ids(int(allocation), local_layout)
+                        local_groups = list(local_block_ids)
+                        for group_id in self.private_swa_group_ids:
+                            local_groups[group_id] = local_pages
+                        local_block_ids = tuple(local_groups)
+                        expected_length = (
+                            int(request.num_computed_tokens)
+                            + int(num_external_tokens)
+                        )
+                        imported_start = int(private_layout["window_start"])
+                        imported_end = int(private_layout["valid_length"])
+                        required_start = max(
+                            0,
+                            expected_length
+                            - int(private_layout["window_size"])
+                            + 1,
+                        )
+                        if (
+                            imported_end < expected_length
+                            or imported_start > required_start
+                        ):
+                            raise RuntimeError(
+                                "remote private SWA does not cover the "
+                                f"expected prefix [0, {expected_length})"
+                            )
+                        request.private_swa_transfer_state = (
+                            PRIVATE_SWA_TRANSFER_RECEIVING
+                        )
+                        request.private_swa_imported_window_start = (
+                            imported_start
+                        )
+                        request.private_swa_imported_valid_length = imported_end
+                        transfer_match_block_ids = next(
+                            (
+                                group_blocks
+                                for group_id, group_blocks in enumerate(
+                                    local_block_ids
+                                )
+                                if (
+                                    group_id not in self.private_swa_group_ids
+                                    and group_blocks
+                                )
+                            ),
+                            None,
+                        )
+                        if transfer_match_block_ids is None:
+                            transfer_match_block_ids = next(
+                                (
+                                    group_blocks
+                                    for group_blocks in local_block_ids
+                                    if group_blocks
+                                ),
+                                None,
+                            )
+                        if transfer_match_block_ids is None:
+                            raise RuntimeError(
+                                "remote private SWA transfer has no local "
+                                "blocks for failure tracking"
+                            )
+                        request.private_swa_transfer_shared_block_ids = (
+                            frozenset(
+                                int(block_id)
+                                for block_id in transfer_match_block_ids
+                            )
+                        )
+                        self._private_swa_receiving_requests[
+                            request.request_id
+                        ] = request
                     # Get unhashed blocks to pull from remote.
                     self._reqs_need_recv[request.request_id] = (request, local_block_ids, num_external_tokens)
                 else:
@@ -1386,6 +1689,40 @@ class MooncakeConnectorScheduler:
                 assert num_external_tokens == 0
             # Only trigger 1 KV transfer per request.
             params["do_remote_prefill"] = False
+
+    def update_connector_output(
+        self, connector_output: KVConnectorOutput
+    ) -> None:
+        """Publish private-SWA receive completion to scheduler requests."""
+        finished_recving = set(connector_output.finished_recving or ())
+        invalid_block_ids = set(
+            getattr(connector_output, "invalid_block_ids", None) or ()
+        )
+        for request_id in finished_recving:
+            request = self._private_swa_receiving_requests.pop(
+                request_id, None
+            )
+            if request is None:
+                continue
+            shared_block_ids = set(
+                getattr(
+                    request,
+                    "private_swa_transfer_shared_block_ids",
+                    (),
+                )
+            )
+            transfer_failed = bool(
+                invalid_block_ids
+                and (
+                    not shared_block_ids
+                    or invalid_block_ids.intersection(shared_block_ids)
+                )
+            )
+            request.private_swa_transfer_state = (
+                PRIVATE_SWA_TRANSFER_FAILED
+                if transfer_failed
+                else PRIVATE_SWA_TRANSFER_READY
+            )
 
     def build_connector_meta(
         self,
@@ -1441,6 +1778,44 @@ class MooncakeConnectorScheduler:
         # prompt length. Drop those unwritten blocks before SWA tail clipping.
         computed_block_ids = self._compute_transfer_block_ids(block_ids, request.num_prompt_tokens)
         computed_block_ids = self.get_sw_clipped_blocks(computed_block_ids)
+        private_layout = None
+        if self.private_swa_group_ids:
+            allocation = getattr(request, "private_swa_allocation", None)
+            if allocation is None:
+                raise RuntimeError("prefill request has no private SWA allocation")
+            # All DSV4 SWA groups share the same request-private allocation
+            # layout; only the layer grouping differs.  Carry one canonical
+            # layout in metadata and apply its page order to every private
+            # group on both sides.
+            group_id = min(self.private_swa_group_ids)
+            private_layout = dict(self.private_swa_group_layouts[group_id])
+            # request_finished runs after the final Prefill execution. Use
+            # the completed length and transfer only the committed tail; the
+            # before data that the small ring still retains.
+            valid_length = int(request.num_computed_tokens)
+            if valid_length <= 0:
+                valid_length = int(getattr(request, "private_swa_valid_length",
+                                           request.num_prompt_tokens))
+            confirmed_length = valid_length
+            window_start = max(0, valid_length - private_layout["window_size"])
+
+            private_layout.update(
+                group_id=group_id,
+                allocation_handle=int(allocation),
+                confirmed_length=confirmed_length,
+                valid_length=valid_length,
+                window_start=window_start,
+
+                first_page_offset=window_start % private_layout["physical_block_size"],
+                last_page_valid_length=(valid_length % private_layout["physical_block_size"]
+                                        or private_layout["physical_block_size"]),
+            )
+            private_layout["page_order"] = self._private_page_ids(
+                int(allocation), private_layout)
+            computed_groups = list(computed_block_ids)
+            for private_group_id in self.private_swa_group_ids:
+                computed_groups[private_group_id] = list(private_layout["page_order"])
+            computed_block_ids = tuple(computed_groups)
         computed_block_lens = [len(block_id_list) for block_id_list in computed_block_ids]
         delay_free_blocks = sum(computed_block_lens) > 0
         if delay_free_blocks:
@@ -1461,6 +1836,7 @@ class MooncakeConnectorScheduler:
             last_token_id=request.output_token_ids[-1],
             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
             num_prompt_blocks=num_prompt_blocks,
+            private_swa_layout=private_layout,
         )
 
     def set_xfer_handshake_metadata(self, metadata: dict[int, KVConnectorHandshakeMetadata]) -> None:
@@ -1518,6 +1894,30 @@ class MooncakeConnectorWorker:
             and len(kv_cache_config.kv_cache_groups) > 1
         )
         self.hma_group_size = len(kv_cache_config.kv_cache_groups)
+        self.private_swa_group_layouts: dict[str, dict[str, Any]] = {}
+        speculative_config = vllm_config.speculative_config
+        draft_tokens = (getattr(speculative_config, "num_speculative_tokens", 0)
+                        if speculative_config is not None else 0)
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            if not ascend_envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL:
+                continue
+            specs = (list(group.kv_cache_spec.kv_cache_specs.values())
+                     if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                     else [group.kv_cache_spec])
+            spec = next((item for item in specs
+                         if isinstance(item, SlidingWindowSpec)
+                         and getattr(item, "model_version", None) == "deepseek_v4"), None)
+            if spec is not None:
+                capacity = int(spec.sliding_window) + draft_tokens
+                pages = ((capacity + int(spec.block_size) - 1)
+                         // int(spec.block_size))
+                self.private_swa_group_layouts[str(group_id)] = {
+                    "layout_version": 1, "pool_type": "private",
+                    "physical_block_size": int(spec.block_size),
+                    "window_size": int(spec.sliding_window),
+                    "in_flight_tokens": 1 + draft_tokens,
+                    "blocks_per_allocation": pages,
+                }
 
         # Mamba metadata
         self._is_mamba_group = [isinstance(group.kv_cache_spec, MambaSpec) for group in kv_cache_config.kv_cache_groups]
@@ -1666,7 +2066,7 @@ class MooncakeConnectorWorker:
                     cur_tensor_group_idx.append(layer_group_idx[layer_name])
                     kv_cache_tuple = kv_caches[layer_name]
                     if not isinstance(kv_cache_tuple, (tuple, list)):
-                        kv_cache_tuple = kv_cache_tuple
+                        kv_cache_tuple = [kv_cache_tuple]
                     for single_tensor in kv_cache_tuple:
                         tensor_addr = single_tensor.data_ptr()
                         if tensor_addr in share_tensor_addr or tensor_addr in self.kv_caches_base_addr:
@@ -1694,6 +2094,10 @@ class MooncakeConnectorWorker:
             block_lens=self.block_len_per_addr,
             ssm_sizes=self._mamba_ssm_size,
             local_ip=get_ip(),
+            layout_version=1,
+            block_strides=self.block_stride_per_addr,
+            addr_group_idx=self.addr_group_idx,
+            private_swa_layouts=self.private_swa_group_layouts,
         )
         self.xfer_handshake_metadata = metadata
 
@@ -1732,6 +2136,7 @@ class MooncakeConnectorWorker:
                 self.vllm_config,
                 self.kv_cache_config,
                 self.kv_caches,
+                self.private_swa_group_layouts,
                 self._prefill_pp_layer_partition,
             )
             self.kv_recv_thread.start()
@@ -1766,6 +2171,11 @@ class MooncakeConnectorWorker:
                 len(done_recving),
             )
         return done_sending, done_recving
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        if self.kv_role == "kv_consumer" and self.kv_recv_thread is not None:
+            return self.kv_recv_thread.get_and_clear_invalid_block_ids()
+        return set()
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""

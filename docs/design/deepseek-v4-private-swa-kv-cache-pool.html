@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DeepSeek V4 Request-Private SWA KV Cache Pool 设计方案</title>
+  <style>
+    :root { color-scheme:light; --ink:#17202a; --muted:#5d6d7e; --line:#d5dfe8; --accent:#1769aa; --bg:#f6f8fa; --code:#eef3f7; --warn:#fff8e1; --ok:#eaf7ee; --info:#eaf2fb; }
+    body { max-width:1160px; margin:0 auto; padding:28px; color:var(--ink); font:16px/1.65 system-ui,-apple-system,"Noto Sans SC",sans-serif; }
+    h1 { line-height:1.25; margin-bottom:8px; } h2 { margin-top:34px; border-bottom:1px solid var(--line); padding-bottom:6px; } h3 { margin-top:24px; }
+    table { border-collapse:collapse; width:100%; margin:12px 0 20px; } th,td { border:1px solid var(--line); padding:8px 10px; vertical-align:top; text-align:left; } th { background:var(--bg); }
+    code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; } code { background:var(--code); padding:1px 4px; border-radius:3px; } pre { background:var(--code); padding:14px; overflow:auto; border-radius:5px; }
+    .small { color:var(--muted); font-size:.92em; } .ok,.note,.info { padding:12px 16px; margin:14px 0; } .ok { background:var(--ok); border-left:4px solid #2e8b57; } .note { background:var(--warn); border-left:4px solid #d99a00; } .info { background:var(--info); border-left:4px solid var(--accent); }
+    .tag { display:inline-block; padding:2px 7px; margin-right:4px; border-radius:10px; background:#e8f1fb; color:var(--accent); font-size:.85em; }
+  </style>
+</head>
+<body>
+  <h1>DeepSeek V4 Request-Private SWA KV Cache Pool</h1>
+  <p class="small">完整设计稿 · 独立 pool 使用公共 physical block size；不参与 prefix cache 命中；参与 P/D KV cache 传输；第一版作为 Prefill 尾窗提交目标与 Decode 持久化 cache，采用 A5 紧凑 BUFFER RING。</p>
+
+  <div class="ok"><strong>推荐结论：</strong>保留现有 shared prefix cache pool，新增一个 request-private SWA pool。新 pool 的 physical block size 与公共配置 <code>cache_config.block_size</code> 一致；每个allocation可容纳 <code>W-1+I</code> 个token，pool按 <code>S+R</code>个request slots创建，第一版建议 <code>R=S</code>（总槽位 <code>2*max_num_seqs</code>）。长 Prefill使用启动时预申请的跨层共享batch buffer（Prefill forward之间串行），FA完成后只把最后一个SWA window提交到private pool；Decode/Spec Decode则先写本轮KV再执行FA。SWA group不做hash、prefix lookup或LRU复用，但参与Mooncake P/D尾窗传输。</div>
+
+  <nav class="toc" aria-label="目录">
+    <h2>目录</h2>
+    <ol>
+      <li><a href="#goals">目标与非目标</a></li>
+      <li><a href="#capacity">容量、启动期求解与单位</a></li>
+      <li><a href="#architecture">总体架构</a></li>
+      <li><a href="#abstractions">新增核心抽象</a></li>
+      <li><a href="#prefix-cache">Prefix cache命中语义</a></li>
+      <li><a href="#allocation">分配、调度与原子性</a></li>
+      <li><a href="#fa-timing">Block table、slot mapping与FA时序</a></li>
+      <li><a href="#spec-decode">Speculative decoding状态</a></li>
+      <li><a href="#pd-transfer">PD cache传输</a></li>
+      <li><a href="#lifecycle">Finish、abort与preemption</a></li>
+      <li><a href="#parallel">并行路径（CP/DCP/PCP，后续范围）</a></li>
+      <li><a href="#code-changes">代码改造点</a></li>
+      <li><a href="#implementation">推荐实施步骤</a></li>
+      <li><a href="#tests">测试与验收</a></li>
+      <li><a href="#invariants">必须保持的不变量</a></li>
+    </ol>
+  </nav>
+  <h2 id="goals">1. 目标与非目标</h2>
+  <h3>1.1 目标</h3>
+  <ul>
+    <li>为 DeepSeek V4 的 SWA/win cache增加独立显存池，避免它与 full/compressed prefix blocks共享生命周期。</li>
+    <li>每个运行中的 request独占固定数量的 SWA blocks，不允许跨 request复用。</li>
+    <li>SWA 的本地零命中不再把 full/compressed group的 prefix hit length压成 0。</li>
+    <li>P 节点产生的有效 SWA window可以传到 D 节点，使 D 节点在接收远端 prefix后直接进入 decode。</li>
+    <li>继续使用 Ascend kernel已经支持的公共 physical block size和 paged slot mapping。</li>
+  </ul>
+
+  <h3>1.2 非目标</h3>
+  <ul>
+    <li>新 pool不提供跨 request的 SWA prefix cache。</li>
+    <li>新 pool不进入 hash table、prefix LRU、prefix cache events或 prefix hit指标。</li>
+    <li>第一版不改变 full/compressed cache的 lookup、hash和 eviction语义。</li>
+    <li>第一版不依赖新的环境变量；通过 spec/manager类型识别 private SWA group。</li>
+  </ul>
+
+  <h2 id="capacity">2. 容量、启动期求解与单位</h2>
+  <h3>2.1 单请求容量与pool槽位</h3>
+  <p>定义：</p>
+  <pre><code>B = cache_config.block_size                 # 公共 physical block size，单位 token/block
+W = sliding_window                         # SWA window，单位 token
+D = max_num_lookahead_tokens               # 最大 draft/lookahead token 数
+I = max_in_flight_tokens_per_request        # 本轮FA前写入且尚未结算的新token上界
+S = scheduler_config.max_num_seqs          # 最大同时运行 request 数
+R = max_retained_private_allocations       # PD在途、延迟释放、保留式preempt的槽位预算
+
+capacity_tokens    = W - 1 + I
+blocks_per_request = ceil(capacity_tokens / B)          # compact ring; A5允许页别名
+pool_num_slots     = S + R
+private_num_blocks = 1 + pool_num_slots * blocks_per_request  # local block 0 sentinel
+pool_token_slots   = private_num_blocks * B</code></pre>
+
+  <p>v1 暂不考虑多轮 async speculative token；每轮最多一个当前 token和 <code>D</code> 个 draft，因此固定 <code>I=1+D</code>，容量为 <code>W+D</code>。scheduler 必须保证单 request 的 decode/spec 在途 token 不超过该上界。</p>
+
+  <p>pool的request-slot数不建议只按 <code>S</code>配置，因为request离开running batch后，其allocation可能仍被PD DMA、异步回调或保留式preempt持有。推荐按 <code>S+R</code>预算；暂时没有可靠的 <code>R</code>上界时，第一版取 <code>R=S</code>，即 <code>pool_num_slots=2*S</code>。额外一批槽位用于吸收延迟释放，不表示允许同时执行 <code>2*S</code> 个请求。</p>
+
+  <div class="note"><strong>两倍容量不是正确性保证：</strong>connector卡住、回调丢失或preempted request无限期保留时，<code>2*S</code>仍会耗尽。实现必须有allocation引用计数、状态机、超时/失败回收、占用指标和admission backpressure；无空闲slot时让新请求等待或安全失败，不能复用仍被引用的slot。</div>
+
+
+  <p><code>D</code>应来自调度器真实的最大 lookahead语义，<code>I</code>还要包含当前 token及异步在途 token：</p>
+  <table>
+    <thead><tr><th>模式</th><th>I的取值原则</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>无 speculative decoding</td><td>至少 1</td><td>FA前要先写入当前 token。</td></tr>
+      <tr><td>EAGLE/MTP、普通 draft model</td><td>通常 <code>1 + D</code></td><td>以scheduler实际写入数量为准。</td></tr>
+      <tr><td>DFlash</td><td>取scheduler实际最大值</td><td>需要覆盖实现中额外预留的query/lookahead slot。</td></tr>
+      <tr><td>动态/异步 speculative decoding</td><td>配置允许的最大 per-request in-flight</td><td>不能按单轮动态draft数缩小静态pool。</td></tr>
+    </tbody>
+  </table>
+
+  <p>示例：<code>B=32</code>、<code>W=128</code>、<code>D=4</code>、<code>I=5</code>、<code>S=256</code>，首版取 <code>R=S=256</code>：</p>
+  <pre><code>capacity_tokens    = 128 - 1 + 5 = 132
+blocks_per_request = ceil(132 / 32) = 5              # compact ring
+pool_num_slots     = 256 + 256 = 512
+private_num_blocks = 1 + 512 * 5 = 2561  # sentinel + compact ring blocks
+实际物理容量       = 2561 * 32 = 81952 token slots（含 sentinel；每 request 可用容量仍按 132 token 语义）</code></pre>
+
+  <p>向上取整产生的尾部 padding不可见，不进入有效 KV 长度。pool显存必须在 KV cache profiling/sizing阶段预扣，不能在主 pool完成 sizing后再额外创建。A5 的 FA 支持同一次调用中重复 physical ID，并以 token/offset mask 屏蔽无效位置，因此 v1 采用紧凑 ring 页数。</p>
+
+  <h3>2.2 服务启动时dummy run后的双pool求解</h3>
+  <div class="info"><strong>Prefill workspace冻结（v1，采用 per-chunk 方案）：</strong>新方案不创建或保留老的 shared SWA cache。Prefill 节点在启动/profile 阶段预申请一个跨层复用的 batch buffer。v1 明确禁止多个 Prefill forward 或流水 microbatch 并行；单个 forward 内可以同时处理多个 request。buffer 按 <code>M_prefill_batch × (W-1+C)</code> 个 token sizing，其中 <code>M_prefill_batch</code> 是单个 forward 的最大 request 数，<code>C</code> 是单 request 最大 chunk token 数，并乘以本地 KV heads、head dim、K/V 双份和 dtype 字节数。每层按如下生命周期执行：<code>restore W-1 history → write batch chunk KV → eager FA → commit last W to private pool → wait event</code>；层间串行复用同一 buffer，只有当前层的 FA、commit copy 和 DMA 引用全部完成后才能覆盖。buffer 不绑定请求生命周期，也不参与 prefix cache、LRU、BlockPool hash 或 Mooncake P/D。</div>
+
+
+  <p>需要补充明确：dummy/profile run只负责得到本rank可用于KV cache的总字节预算；随后必须在一次联合求解中先锁定private pool的正确性容量，再用剩余字节调用现有shared pool求解器。不能先按全部预算创建shared pool，再额外创建private pool。</p>
+  <ol>
+    <li>dummy run测得峰值非KV显存，并结合 <code>gpu_memory_utilization</code>得到 <code>M_profiled_kv</code>；若配置了显式 <code>kv_cache_memory_bytes</code>，则以显式值作为总预算并跳过自动可用量推导。</li>
+    <li>由 <code>B/W/I/S/R</code>先算出固定的 <code>private_num_blocks</code>。首版默认 <code>R=S</code>，即按 <code>2S</code>个request slots预算。</li>
+    <li>用本rank实际private SWA layer spec计算每个physical block的总字节数；同一block ID跨多层分配时必须累加各层 <code>page_size_bytes</code>，不能只按token数或单层page估算。</li>
+    <li>v1不保留shared SWA cache。Prefill使用服务启动时预申请的单个跨层共享 batch buffer，需单独预留 <code>M_prefill_buffer</code>；该buffer只服务当前 Prefill forward，Prefill forward 之间串行，因此不需要多 lane 或 workspace admission。该buffer不参与prefix cache、LRU或PD传输。</li>
+    <li>将剩余预算交给现有hybrid/shared cache sizing逻辑求 <code>shared_num_blocks</code>；保留现有alignment、group/layer布局和最小block数校验。</li>
+    <li>任一rank无解时启动失败并打印完整预算明细。只允许通过显式配置降低 <code>R</code>、<code>max_num_seqs</code>或其他缓存参数，不能静默缩小单请求private容量。</li>
+  </ol>
+  <pre><code>private_block_bytes = sum(local_private_layer.page_size_bytes)&#10;private_bytes       = private_num_blocks * private_block_bytes  # 含 1 个 sentinel block&#10;shared_budget       = M_profiled_kv - private_bytes - M_prefill_buffer - M_alignment_guard&#10;shared_num_blocks   = existing_shared_pool_solver(shared_budget, shared_specs)</code></pre>
+  <p>因此两个pool不是各自对总显存独立做除法：private block数由并发和窗口语义固定，shared block数由dummy run后的剩余字节决定。P/D、TP各rank分别按本地layer布局和profile结果计算；P/D的shared block数可以不同，但 <code>B</code>、private布局版本、每请求容量及PD传输协议必须兼容。</p>
+  <div class="note"><strong>启动校验：</strong><code>shared_budget</code>必须为正，shared pool还要满足现有 <code>max_model_len</code>最低容量检查；private pool tensor实际分配字节必须与预扣值一致。建议日志同时打印总预算、private/shared/Prefill执行cache字节数、两个pool的block数、slot数及padding浪费。</div>
+  <p><strong>Sentinel 计入容量：</strong>private pool 的总 block 数包含 1 个 sentinel；request allocation 的物理 block 从 local block 1 开始，slot mapping 严禁写入 local block 0。</p>
+  <p>向上取整产生的尾部padding不可见，不进入有效KV长度。v1按第7.2节的紧凑 ring 公式计算 <code>private_num_blocks</code>；重复 physical ID 和首尾 partial page 的可见性由 A5 的 token/offset mask 保证。</p>
+
+  <h2 id="architecture">3. 总体架构</h2>
+  <pre>Ascend KVCacheManager / HybridKVCacheCoordinator
+│
+├─ Shared BlockPool                         [现有]
+│  ├─ full/compressed MLA groups
+│  ├─ hash + prefix lookup + LRU
+│  ├─ prefix cache hit由这些 group决定
+│  └─ 参与 PD transfer
+│
+└─ RequestPrivateSWABlockPool               [新增]
+   ├─ physical block size = B
+   ├─ private local block 0 = zero-initialized sentinel（不分配给 request）
+   ├─ S + R 个 request allocation slots（首版建议 2S）
+   ├─ 每 slot包含 blocks_per_request 个连续或有序 physical blocks
+   ├─ request_id → PrivateSWAAllocation
+   ├─ no hash / no prefix lookup / no LRU
+   └─ 参与 PD transfer</pre>
+
+  <p><strong>Block ID 命名空间（v1）：</strong>host、scheduler 和 Mooncake metadata 使用类型化标识 <code>(pool_type, local_block_id)</code>，明确区分 shared 与 private_swa。private local block 0 固定为 zero-initialized sentinel，仅用于窗口外逻辑页 padding，不分配给 request，不参与 slot_mapping、释放、hash 或 P/D 传输；request allocation 从 local block 1 开始。现有 NPU BlockTable/slot_mapping tensor 仍要求整数，因此进入 runner/kernel 边界时编码为 pool-aware 整数，shared null block 与 private sentinel 必须区分；sentinel 不能替代 FA mask。</p>  <p>编码在 dummy run 联合 sizing 完成后确定：<code>PRIVATE_BASE = shared_num_blocks + 1</code>（<code>0</code> 保留为 null block），<code>encoded_private_id = PRIVATE_BASE + local_block_id</code>。scheduler/host/connector 保存类型化 ID；runner 根据方案 A 由 allocation handle 和 absolute position 推导 local ID，再在 BlockTable/kernel 边界编码。访问 KV tensor 前必须解码回 <code>(pool_type, local_id)</code>，不能把 encoded ID 直接作为 private tensor 下标；P/D 两端各自使用本地 offset，metadata 传 pool_type 和 local IDs。</p>
+
+  <p>推荐仍将 private SWA注册为正式 KV cache group，而不是只在 worker侧旁路创建 tensor。这样以下既有数据链仍然成立：</p>
+  <pre>scheduler allocation
+  → KVCacheBlocks(group-indexed block IDs)
+  → SchedulerOutput
+  → ModelRunner BlockTable
+  → DSA metadata / slot_mapping
+  → Mooncake send/recv metadata</pre>
+
+  <h2 id="abstractions">4. 新增核心抽象</h2>
+  <h3>4.1 PrivateSWAAllocation</h3>
+  <pre><code>@dataclass
+class PrivateSWAAllocation:
+    request_id: str
+    block_ids: list[int]       # private local IDs；host/metadata 逻辑类型为 (pool_type=private_swa, local_id)
+    window_start: int          # 当前有效窗口的全局逻辑起点
+    valid_length: int          # allocation内当前可见token数，最大 W - 1 + I
+    confirmed_length: int      # speculative accept/reject 后的确认边界
+    transfer_ref_count: int    # 异步 PD send/recv 持有计数</code></pre>
+
+  <h3>4.2 RequestPrivateSWABlockPool</h3>
+  <ul>
+    <li>启动时创建 <code>private_num_blocks</code> 个physical blocks，共划分为 <code>S+R</code>个allocation slots。</li>
+    <li>以 allocation slot为分配单位；一次取出固定 <code>blocks_per_request</code> 个 block IDs。</li>
+    <li>block ID可以连续，也可以是有序列表；不能让 connector假定一定连续。</li>
+    <li>只维护 free allocations、request映射和 transfer引用；不复用现有 prefix hash/LRU逻辑。</li>
+    <li>同一 request重复请求分配时必须幂等返回原 allocation。</li>
+  </ul>
+
+  <p><strong>长表协议（v1 方案 A）：</strong>private allocation 一次性固定分配 physical blocks。scheduler→runner 不逐步 append block ID；每步只发送 allocation handle、confirmed_length、valid_length、window_start 及首尾 partial-page metadata，runner 根据 absolute position 和 <code>max_pages</code> 计算逻辑长表与 slot mapping。这样可兼容 batch 内多 request，且不会触发 free-list/hash。</p>
+
+<h3>4.3 PrivateSlidingWindowManager</h3>
+  <ul>
+    <li><code>find_longest_cache_hit()</code>永远不查询 private pool。</li>
+    <li>请求第一次需要 SWA时分配完整 allocation，不随 token增长逐 block追加。</li>
+    <li>不执行普通 <code>SlidingWindowManager.remove_skipped_blocks()</code> 的逐页释放。</li>
+    <li>finish/preempt/abort时按完整 allocation释放；存在异步 transfer引用时延迟释放。</li>
+    <li>scheduler 只输出 private allocation handle、confirmed_length、valid_length 和 window_start；runner 按绝对逻辑位置无状态推导 <code>private_block_ids[logical_block % max_pages]</code>，不把环形复用误当成新 physical block 分配。</li>
+  </ul>
+
+  <h2 id="prefix-cache">5. Prefix cache 命中语义</h2>
+  <p>prefix hit只由 shared cache groups决定。private SWA group返回空 hit block列表，但不参与 group间 hit length的最小值归约：</p>
+  <pre><code>for group in cache_groups:
+    if group.is_request_private_swa:
+        hit_blocks[group.id] = []
+        continue                  # 不更新 curr_hit_length
+
+    group_hit = group.manager.find_longest_cache_hit(...)
+    curr_hit_length = min(curr_hit_length, group_hit.length)</code></pre>
+
+  <p>这与当前 PD 下 Mamba state的处理原则一致：本地没有可复用的 prefix block，但外部状态可通过 connector注入。需要同时满足：</p>
+  <ul>
+    <li>shared prefix hit为 <code>H</code> 时，最终 hit length仍可为 <code>H</code>。</li>
+    <li>private SWA group的 <code>new_computed_blocks</code>为空，不得错误引用其他 request的 SWA。</li>
+    <li>本方案允许 SWA 从 shared hit 的 <code>H</code> 位置直接重新计算，并接受首段因缺少前置 <code>W</code> 个 SWA KV 而产生的精度误差，因此不需要回退或全量重算。实现必须使用 position-based kernel mask 排除缺失位置；零填充仅用于内存卫生，不能替代 mask，禁止读取未初始化显存；P/D 两端需保持相同的 warm-up 语义。</li>
+  </ul>
+
+  <h2 id="allocation">6. 分配、调度与原子性</h2>
+  <h3>6.1 新请求/本地 prefill</h3>
+  <ol>
+    <li>shared groups执行正常 prefix lookup。</li>
+    <li>coordinator检查 shared pool容量和 private pool是否有一个 free allocation。</li>
+    <li>预留 private allocation，再分配 shared blocks；任一步失败时回滚本轮全部预留。</li>
+    <li>scheduler output携带每个 group的 block IDs。</li>
+    <li>runner将 private group的 block IDs填入独立 BlockTable行。</li>
+  </ol>
+
+  <h3>6.2 双 pool容量检查</h3>
+  <p>现有 coordinator以一个 <code>self.block_pool.get_num_free_blocks()</code>检查所有 manager需求；新增 pool后不能再把两类 block需求相加后与一个 pool比较。</p>
+  <pre><code>if shared_pool.free_blocks &lt; shared_required:
+    return None
+if private_swa_pool.free_allocations &lt; private_required_allocations:
+    return None
+
+private_reservation = private_swa_pool.reserve(request_id)
+try:
+    shared_result = allocate_shared_groups(...)
+except Exception:
+    private_swa_pool.rollback(private_reservation)
+    raise</code></pre>
+
+  <p><code>S=max_num_seqs</code>只覆盖running requests；delayed-free、异步batch和preemption会使仍持有allocation的请求数暂时更大，因此用 <code>R</code>单独预算滞留allocation，首版建议 <code>R=S</code>。即使配置为 <code>2S</code>，也必须保留申请失败、调度反压和双pool回滚路径。</p>
+
+  <h2 id="fa-timing">7. Block table、slot mapping 与 FA 时序</h2>
+  <h3>7.1 逻辑长表映射物理短池</h3>
+  <p>当前 worker和DSA metadata按绝对 token position索引：<code>logical_block_idx=position//B</code>。因此不能把给 kernel的 block table简单缩成 <code>blocks_per_request</code> 个 entry，也不能把 <code>positions</code>或 <code>seq_lens</code>重置成窗口内相对值。推荐保留按最大序列长度寻址的逻辑长表，只把表项循环映射到固定的短物理 allocation：</p>
+  <pre><code>absolute_pos       = positions[token]
+logical_block_idx  = absolute_pos // B
+block_offset       = absolute_pos % B
+ring_block_idx     = logical_block_idx % blocks_per_request
+physical_block_id  = private_block_ids[ring_block_idx]  # 不包含 sentinel block 0
+logical_block_table[logical_block_idx] = physical_block_id
+slot               = physical_block_id * B + block_offset</code></pre>
+
+  <p><strong>Private pool sentinel padding（v1）：</strong>private local block 0 作为 zero-initialized fake block。窗口外的绝对 logical page 可填入 sentinel，例如 <code>[fake, fake, ..., real_block_0, real_block_1]</code>，但真实 block 必须仍位于其绝对 logical index；sentinel 仅作为越界读取的内存安全兜底，不能替代 <code>seqused_kv</code>、<code>ori_win_left</code> 或 causal mask。窗口首尾非整页时，真实首尾页仍需保留并由 mask/offset 屏蔽无效 token。</p>
+  <p><strong>P/D 两侧 FA block_table（v1）：</strong>P 侧 Prefill FA 使用预先申请的临时 batch buffer，不使用 private pool sentinel；D 侧 Decode FA 使用本地 private pool，并在逻辑长表中加入本地 sentinel padding。两侧 block table 不是同一张表，PD 只传输有效 KV 和布局 metadata。示例中 <code>B=32</code>、窗口起点 offset 为 31：</p>
+  <pre><code>P（临时 buffer）：[P_buf_0, P_buf_1, P_buf_2, P_buf_3, P_buf_4]
+D（private ring）：[D_fake, D_fake, D_fake, D0, D1, D2, D3, D4, D0]</code></pre>
+  <p>P 侧 <code>P_buf_*</code> 是当前 Prefill forward 的 buffer block，FA 完成后才按 absolute position scatter/commit 到 private pool；P 侧不需要 fake block。D 侧 <code>D_fake</code> 是 D 本地 private pool 的 local block 0 sentinel，不通过 PD 传输、不参与 KV copy，末尾再次出现 <code>D0</code> 是 A5 允许的重复 physical ID。D 侧 FA 通过 <code>first_page_offset</code>、<code>last_page_valid_length</code> 及 token/offset mask 忽略 sentinel 和 partial page 中的无效 token；两侧 block ID 进入 kernel 前均编码为 pool-aware 整数。</p>
+  <p>逻辑长表只是 int32 metadata；占用显存主体的 KV tensor仍只有固定短池。物理槽位由 <code>(request_id, absolute_pos)</code>确定，不使用 speculative accept/reject时难以回退的可变 cursor。以下字段继续保持完整序列语义：</p>
+  <ul>
+    <li><code>positions</code>保持绝对位置，保证 RoPE正确。</li>
+    <li><code>seq_lens</code>保持完整序列长度，不能截成 W。</li>
+    <li><code>query_start_loc</code>、<code>start_pos</code>保持现有语义。</li>
+    <li><code>ori_win_left=W-1</code>和causal mask负责限制 FA实际可见范围。</li>
+    <li>只有 <code>swa_metadata.block_table</code>、<code>swa_metadata.slot_mapping</code>和 <code>swa_kv_cache</code>切换到新 pool。</li>
+  </ul>
+
+  <div class="note"><strong>实现前必须验证：</strong>DSA Flash Attention是否只访问 mask内逻辑页、是否允许同一 block table中重复出现 physical block ID，以及窗口从页中间开始时首尾 offset是否正确。如果不支持，应增加一页容量或为算子增加显式 rebased-window能力，不能仅缩短 table。</div>
+
+  <h3>7.2 容量、页边界与 in-flight</h3>
+  <p>安全容量应覆盖执行前仍需保留的 <code>W-1</code> 个 confirmed token和本轮所有未结算 token：</p>
+  <pre><code>I = max_in_flight_tokens_per_request
+capacity_tokens = W - 1 + I
+
+# 普通 speculative decode：1个当前token + D个draft
+I = 1 + D
+capacity_tokens = W + D</code></pre>
+  <p>若 async scheduling允许同一 request存在多轮未结算 token，<code>I</code>必须取会写入 private pool 的真实 per-request decode/spec 上界，不能把 Prefill workspace token重复计入。v1采用紧凑 ring：<code>blocks_per_request = ceil(capacity_tokens/B)</code>。A5 FA 允许重复 physical ID，首尾 partial page 通过 token/offset mask 屏蔽。</p>
+
+  <h4 id="compact-ring">7.2.1 Compact BUFFER RING（A5默认）</h4>
+  <p>A5 DSV4 Flash 允许同一次 FA 的 block table 出现重复 physical ID，并支持 token/offset 级 mask。因此 private allocation 只按有效容量的最少页数分配，窗口首尾 partial page 可以安全复用同一 physical block：</p>
+  <pre><code>max_pages = ceil(capacity_tokens / B)
+private_num_blocks = 1 + (max_num_seqs + delayed_free_slots) * max_pages  # block 0 reserved sentinel</code></pre>
+  <p>例如B=32、W=128、I=5时，capacity_tokens=132，紧凑 ring 只需5页。逻辑页按绝对 position 取模，首尾 partial page 的无效 token 由 mask 屏蔽；同一 FA 中允许首尾逻辑页映射到重复 physical ID：</p>
+  <pre><code>logical_block_idx = absolute_pos // B
+ring_block_idx    = logical_block_idx % max_pages
+physical_id       = private_block_ids[ring_block_idx]  # private local block 0 为 sentinel，禁止命中</code></pre>
+  <p>Compact ring 能力必须纳入 P/D layout 版本协商；metadata 携带 first_page_offset、last_page_valid_length、page_order 及 <code>ring_mode=compact</code>。接收端必须确认 A5 重复 physical ID 与 token/offset mask 能力，不满足时直接拒绝该 layout。</p>
+
+  <h4 id="prefill-origin">7.2.2 Prefill与Decode的最终定位策略</h4>
+  <p>首版不采用“Prefill窗口首token重定位到slot 0、Decode再切换相对base”的方案。Prefill尾窗提交和后续Decode统一使用绝对position语义，不引入<code>swa_base_position</code>偏移：</p>
+  <pre><code>logical_block_idx = absolute_position // B
+block_offset      = absolute_position % B
+ring_block_idx    = logical_block_idx % max_pages
+physical_id       = private_block_ids[ring_block_idx]  # private local block 0 为 sentinel，禁止命中
+slot              = physical_id * B + block_offset</code></pre>
+  <p>为覆盖Prefill窗口首尾不对齐以及Decode环形覆盖的最坏情况，每个private allocation使用<code>max_pages = ceil(capacity_tokens/B)</code>个compact ring block。因此FA读取的<code>block_table</code>与KV写入的<code>slot_mapping</code>始终由同一绝对position公式生成，Prefill到Decode无需切换寻址基址。</p>
+  <p>Prefill阶段只提交最后<code>W</code>个有效KV到private pool；Decode阶段将新token按绝对position递增写入对应环形slot，超过容量后覆盖最旧窗口。窗口首尾partial page可映射到相同physical ID，A5 token/offset mask屏蔽已滑出窗口或未填充位置。PD metadata仍需携带首尾offset/length及逻辑页顺序，以便跨节点按绝对区间恢复。</p>
+  <p>相对base重定位方案保留为后续优化，不纳入首版实现；它需要FA支持动态base offset，并会增加算子、slot mapping及PD协议复杂度。</p>
+
+  <h3>7.3 Prefix 命中后的 128-token 回退</h3>
+  <p>设原始 shared prefix 命中长度为 <code>H</code>，实际计算起点为 <code>R = align_down(max(0, H - 128), lcm_block_size)</code>，本轮计算范围为 <code>[R,P)</code>。<code>[R,H)</code> 只重新计算并更新 SWA；compressor/indexer 的持久化写入起点保持为 <code>H</code>，避免覆盖命中的 cache。</p>
+  <pre><code>compute_range          = [R, P)
+swa_write_range        = [R, P)
+compressor_write_range = [H, P)
+indexer_write_range    = [H, P)</code></pre>
+  <p>因此 compressor/indexer 的 hidden states、positions、<code>cu_seqlens</code>、state table 和 slot mapping 必须按 <code>[H,P)</code>构造；SWA/query 仍按 <code>[R,P)</code>计算。若 state 算子不支持写入边界，则使用只读/sentinel state table 或分段执行。</p>
+
+  <h3>7.4 FA读写时序</h3>
+  <p>FA 当前通过 <code>ori_kv</code> 和 paged block table 读取 SWA KV。回退区写入临时 SWA buffer，FA 完成后提交 private pool；compressor/indexer 只读取命中 cache。未命中区从 H 边界 state 开始正常更新 shared cache。</p>
+  <table>
+    <thead><tr><th>阶段</th><th>正确时序</th><th>原因</th></tr></thead>
+    <tbody>
+      <tr><td>长 Prefill</td><td>从跨层共享batch buffer恢复 W-1 history → 写入当前batch chunk KV → eager FA → 提交最后 W 个有效 KV到private pool</td><td>同一 chunk前部 query所需窗口不能被后部 token提前覆盖。</td></tr>
+      <tr><td>普通 Decode</td><td>当前 token KV写private pool → FA读取private pool</td><td>当前 token本身属于本轮attention的K/V。</td></tr>
+      <tr><td>Spec Decode</td><td>当前 token及draft KV写private pool → FA读取confirmed window和合法lookahead</td><td>draft token之间存在causal依赖。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>7.5 Prefill尾窗提交</h3>
+  <p>第一版把新 pool定位为 Prefill结果的持久化目标；长 Prefill当前调用使用启动时预申请的跨层共享 batch buffer，不使用 shared SWA cache。每层FA完成后，按每个request的绝对区间分别只提交最后一个有效窗口：</p>
+  <pre><code>confirmed_end = seq_len
+copy_start = max(0, confirmed_end - W)
+copy_range = [copy_start, confirmed_end)</code></pre>
+  <p>源地址来自batch buffer中对应request的固定slot，目标地址由private pool的绝对位置环形映射产生。长 Prefill完成前不能先把整个chunk取模写进private pool，否则后部token会覆盖前部query仍需读取的KV。当前层commit及异步引用确认后，buffer才可被下一层覆盖；它不是shared SWA cache。若未来FA支持“历史private cache + 当前chunk直接K/V”双输入，才可以去掉该workspace。</p>
+
+  <h2 id="spec-decode">8. Speculative decoding 状态</h2>
+  <p>private allocation中同时保存 confirmed window和本轮未验证 draft KV：</p>
+  <pre>稳态：  [ last W confirmed tokens ][ padding ]
+执行前：[ last W-1 prior confirmed ][ up to I in-flight tokens ][ padding ]
+边界：  confirmed boundary位于prior confirmed末尾；valid boundary位于本轮已写入token末尾。</pre>
+
+  <ul>
+    <li>draft槽位由绝对 position取模决定，不依赖单向推进且难以回退的ring cursor。</li>
+    <li>draft写入时只扩大本轮可见的 <code>valid_length</code>。</li>
+    <li>accept后推进 <code>confirmed_length</code>并更新下一轮窗口起点。</li>
+    <li>reject后回退 <code>valid_length</code>到确认边界；被拒绝 KV可作为不可见脏数据保留，下一轮相同绝对 position覆盖它。</li>
+    <li>最大瞬时占用必须按 scheduler实际 lookahead计算，尤其覆盖 <code>draft_num + 1</code>模式。</li>
+  </ul>
+
+  <h2 id="pd-transfer">9. PD cache 传输</h2>
+  <h3>9.1 语义</h3>
+  <p>“不参与 prefix cache”只禁止本地按 hash跨 request复用；并不禁止把同一 request在 P 节点产生的 SWA状态传给 D 节点。P/D两端分别分配本地 private allocation，connector按绝对有效区间 <code>[max(0, confirmed_end-W), confirmed_end)</code>完成 remote到local映射。默认只传已确认 token，不传未验证 draft。</p>
+
+  <h3>9.2 必需 metadata</h3>
+  <table>
+    <thead><tr><th>字段</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td><code>layout_version</code></td><td>标识 private SWA 布局协议版本，校验 P/D 两端兼容性。</td></tr>
+      <tr><td><code>remote_private_block_ids</code></td><td>P 侧源数据所在的有序 physical block 列表。</td></tr>
+      <tr><td><code>local_private_block_ids</code></td><td>D 侧 allocation 对应的目标 physical block 列表。</td></tr>
+      <tr><td><code>physical_block_size</code></td><td>每个 block 的 token 容量，当前为 32；P/D 必须一致。</td></tr>
+      <tr><td><code>window_start</code></td><td>当前有效 SWA 窗口的全局起始 position，用于绝对位置对齐。</td></tr>
+      <tr><td><code>valid_length</code></td><td>需要复制和恢复的有效 token 数，不包含 padding 或无效 draft。</td></tr>
+      <tr><td><code>last_page_valid_length</code></td><td>尾部 partial page 中真正有效的 token 数。</td></tr>
+      <tr><td><code>confirmed_length</code></td><td>已确认 token 的边界，避免传输被 reject 的 draft KV。</td></tr>
+      <tr><td><code>first_page_offset</code></td><td>窗口起点在首个 block 内的 token offset。</td></tr>
+      <tr><td><code>page_order</code></td><td>环形复用后逻辑 page 到 physical page 的顺序。</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>P/D 强校验（v1）：</strong>传输建立前必须逐字段比较 <code>layout_version</code>、<code>physical_block_size</code>、<code>W</code>、<code>I</code>、<code>max_pages</code>、<code>ring_mode=compact</code> 及首尾 page 语义；任一不一致立即 fail-fast，禁止仅以“容量足够”继续传输。</p>
+
+
+  <h3>9.3 P→D流程</h3>
+  <ol>
+    <li>connector从 remote参数得知 shared prefix token数及 private SWA描述。</li>
+    <li>D侧 coordinator先为 request分配 local private allocation。</li>
+    <li><code>update_state_after_alloc()</code>记录 remote/local block映射和有效区间。</li>
+    <li>worker异步复制有效 SWA pages；首尾部分页按 offset/length处理。</li>
+    <li>复制完成后安装 <code>window_start</code>、有效长度和page order，才允许 request继续 decode。</li>
+  </ol>
+
+  <h3>9.4 P侧发送与 delayed free</h3>
+  <p>当前 Mooncake connector会裁剪普通 SWA group的尾部 blocks。private SWA必须走独立分支：</p>
+  <ul>
+    <li>不再使用 <code>blocks[-blocks_per_window:]</code>推导传输页。</li>
+    <li>使用 allocation中记录的绝对有效区间、有序有效 pages和首尾 offset；存在逻辑首尾页别名时，整页传输按physical ID去重并保证P/D ring phase一致。</li>
+    <li>block ID <code>0</code>若在 private pool命名空间中合法，不得被通用逻辑过滤。</li>
+    <li>发送注册后增加 <code>transfer_ref_count</code>；完成或失败回调后递减，归零才释放。</li>
+  </ul>
+
+  <h2 id="lifecycle">10. Finish、abort 与 preemption</h2>
+  <table>
+    <thead><tr><th>事件</th><th>处理</th></tr></thead>
+    <tbody>
+      <tr><td>正常 finish，无 PD send</td><td>立即归还完整 private allocation。</td></tr>
+      <tr><td>正常 finish，需要 PD send</td><td>标记 delayed free；发送完成后归还。</td></tr>
+      <tr><td>abort/cancel</td><td>取消未开始的 transfer；等待在途 DMA安全结束后归还。</td></tr>
+      <tr><td>preempt并保留请求</td><td>第一版推荐保留 allocation；需要把占用计入 admission。</td></tr>
+      <tr><td>preempt并释放 allocation</td><td>resume时可从 H 位置继续 SWA 重算并接受缺失窗口带来的精度误差；仍需初始化缺失 slot，不能读取未初始化 cache。</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>Retained allocation 高水位规则（v1）：</strong>第一版建议配置 <code>pool_num_slots=2*max_num_seqs</code>，额外的 S 个 slot 作为 PD delayed-free、异步回调和保留式 preempt 的共享余量。当 <code>used_slots / pool_num_slots &gt;= 90%</code> 时进入高水位：停止继续保留新的 preempt allocation，并优先释放暂停时间最长、且没有 FA、DMA、Mooncake transfer 引用的 retained allocation。释放时保留 request 的 <code>confirmed_length</code>、<code>resume_position</code>、<code>window_start</code> 和 prefix hit 状态；resume 时重新申请 private allocation，通过 Prefill eager 重算并重新提交尾窗。存在外部引用的 allocation 只能 delayed free，不能强制回收。若达到硬上限且没有可安全释放的 allocation，则对新 request admission 反压或安全失败，禁止复用仍被引用的 slot。</p>
+
+  <p>建议暴露 <code>private_swa_slots_used</code>、<code>private_swa_slots_retained</code>、<code>private_swa_delayed_free_age_max</code>、allocation失败次数和PD超时次数。长期接近 <code>S+R</code>说明应扩大R或修复释放链路，不能只靠持续扩容掩盖泄漏。</p>
+
+  <h2 id="parallel">11. CP/DCP/PCP（后续范围，v1不支持）</h2>
+  <p class="note">v1 上板范围不包含 CP、DCP、PCP。private SWA 的容量、block table、slot mapping 和 Mooncake P/D 仅按单卡/TP 路径实现；本节内容保留为后续扩展，不作为当前端到端验收条件。</p>
+  <ul>
+    <li><code>W</code>、<code>I</code>和 <code>window_start</code>使用全局 token position语义。</li>
+    <li>每rank的实际physical blocks和block字节数应按当前CP切分规则计算，不能简单在每个rank完整复制 <code>W-1+I</code>，除非DSA现有布局本就复制。</li>
+    <li>scheduler-visible block IDs若为 CP virtual/grouped IDs，connector必须按现有 CP映射展开为 rank-local physical IDs。</li>
+    <li>PD传输 metadata需携带全局有效区间，各 rank据此求本地区间。</li>
+    <li>speculative slots跨 CP rank时，应复用现有 draft slot mapping规则，不能独立做一次错误的取模。</li>
+  </ul>
+
+  <h2 id="code-changes">12. 代码改造点</h2>
+  <table>
+    <thead><tr><th>位置</th><th>改动</th><th>主要风险</th></tr></thead>
+    <tbody>
+      <tr><td><code>vllm_ascend/core/kv_cache_interface.py</code></td><td>增加private SWA spec/属性，表达独立pool、W/I/B、S/R和内存大小。</td><td>不能破坏uniform/hybrid group归类。</td></tr>
+      <tr><td><code>vllm_ascend/patch/platform/patch_kv_cache_utils.py</code></td><td>dummy run后先计算private固定block数与字节，再用剩余预算调用现有shared sizing。</td><td>重复扣减、漏算Prefill执行cache、各rank page字节口径不一致。</td></tr>
+      <tr><td><code>vllm_ascend/patch/platform/patch_kv_cache_coordinator.py</code></td><td>创建第二个 pool和 manager；双 pool原子分配；prefix lookup跳过 private group。</td><td>分配失败回滚、usage统计和 group index一致性。</td></tr>
+      <tr><td>新增 private pool/manager模块</td><td>allocation slot、request映射、引用计数、finish/preempt生命周期。</td><td>重复释放、异步传输期间复用。</td></tr>
+      <tr><td><code>vllm_ascend/worker/block_table.py</code></td><td>保留绝对位置逻辑长表，为 private group生成循环 physical ID映射及draft slot mapping。</td><td>重复physical ID、非整页窗口、padding mask、CP draft slots。</td></tr>
+      <tr><td><code>vllm_ascend/worker/model_runner_v1.py</code></td><td>初始化 private group BlockTable，同步 scheduler block IDs和窗口状态。</td><td>request row move/swap/clear后状态错位。</td></tr>
+      <tr><td><code>vllm_ascend/attention/dsa_v1.py</code></td><td>Prefill通过启动时预申请的跨层共享batch buffer完成eager FA后提交尾窗；Decode保持先scatter private cache再FA；SWA metadata切换新pool。</td><td>长Prefill环形覆盖、kernel读取旧KV或越过confirmed boundary。</td></tr>
+      <tr><td><code>vllm_ascend/device/device_op.py</code></td><td>若 cache tuple/group布局调整，保持 <code>swa_kv_cache</code>解包正确。</td><td>c4/c128路径索引不一致。</td></tr>
+      <tr><td><code>mooncake_connector.py</code></td><td>private SWA metadata、page transfer、delayed free；绕过普通 SWA裁剪。</td><td>remote/local block ID混用。</td></tr>
+      <tr><td><code>mooncake_hybrid_connector.py</code></td><td>同步实现相同协议。</td><td>两种 connector行为分叉。</td></tr>
+      <tr><td><code>patch_async_swa_kv_lifetime.py</code></td><td>private group跳过普通 SWA逐页 prune/recycle。</td><td>异步调度提前释放。</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="implementation">13. 推荐实施步骤</h2>
+  <ol>
+    <li>加入private SWA spec、<code>S+R</code>槽位公式和dummy run后联合显存求解；首版验证 <code>R=S</code>时两个pool的block数、tensor shape与实际分配字节。</li>
+    <li>实现 pool/manager以及单请求固定页分配，不启用 prefix cache和PD。</li>
+    <li>修改 coordinator，让 private group跳过 prefix hit归约，并实现双 pool原子分配。</li>
+    <li>打通 scheduler output → runner绝对位置逻辑长表 → 环形 physical slot mapping。</li>
+    <li>实现 Prefill 回退分段：回退区 [R,H) 仅更新 SWA，未命中区 [H,P) 才更新 compressor/indexer；按需使用跨层 Prefill batch buffer并在每层 FA 后提交尾窗；层间等待copy和DMA引用后复用；验证单forward多request、长于 W 的prefill/decode及 speculative accept/reject。</li>
+    <li>扩展 Mooncake metadata和send/recv；加入 delayed free。</li>
+    <li>最后打开 prefix cache + PD + MTP 组合测试；CP/DCP/PCP 不属于 v1 验收范围。</li>
+  </ol>
+
+  <h2 id="tests">14. 测试与验收</h2>
+  <table>
+    <thead><tr><th>类别</th><th>必须覆盖的场景</th></tr></thead>
+    <tbody>
+      <tr><td>启动容量</td><td><code>W-1+I</code>小于、等于、刚超过B；验证dummy run预算、private预扣、Prefill执行cache预扣、shared余量、各rank page bytes和实际tensor字节完全一致。</td></tr>
+      <tr><td>分配</td><td>S个running request全部成功；再制造最多R个PD/delayed-free滞留allocation；第S+R+1个申请触发安全反压/失败；finish后可复用；异常路径无泄漏。</td></tr>
+      <tr><td>启动无解</td><td>private固定预算超过可用显存、shared余量不足max_model_len、显式kv_cache_memory_bytes过小时明确失败，禁止静默缩容。</td></tr>
+      <tr><td>隔离</td><td>两个相同 prompt的 request不得共享 private block IDs；prefix eviction不影响活跃 SWA。</td></tr>
+      <tr><td>Prefix</td><td>private SWA本地 hit为0时，shared group命中H不被压成0。</td></tr>
+      <tr><td>窗口</td><td>验证 sentinel block 0 前缀 padding、真实 block 的绝对 logical index、slot mapping 不写 sentinel，以及非整页窗口的 mask；prompt/decode长度分别为 <code>W-1</code>、<code>W</code>、<code>W+1</code>及多次跨页；覆盖逻辑页重复physical ID和非整页起点；结果与基线一致。</td></tr>
+      <tr><td>Prefill时序</td><td>单次chunk远大于private容量、跨多个chunk、Prefill转Decode；确认FA前无过早覆盖，提交后private pool只保留尾窗。</td></tr>
+      <tr><td>Spec decode</td><td>draft 0/1/N、全接收、部分接收、全拒绝；覆盖需要 <code>draft+1</code> lookahead的方法。</td></tr>
+      <tr><td>PD</td><td>P/D block IDs不同仍正确复制；部分首尾页、block 0、传输失败、delayed free。</td></tr>
+      <tr><td>生命周期</td><td>finish、abort、preempt/resume、异步 batch并发，无 use-after-free或重复释放。</td></tr>
+      
+          </tbody>
+  </table>
+
+  <h2 id="invariants">15. 必须保持的不变量</h2>
+  <pre><code>1. 一个 request 在任一时刻最多拥有一个 private SWA allocation。
+2. allocation 包含固定 blocks_per_request 个 physical blocks。
+3. 不同 request 的 private physical block集合不相交。
+4. private blocks从不进入 prefix hash/LRU。
+5. valid_length &lt;= W - 1 + I &lt;= blocks_per_request * B；I覆盖真实per-request in-flight上界。
+6. attention可见范围不超过 confirmed window + 本轮合法 lookahead。
+7. transfer完成前 allocation不可回收到其他 request。
+8. scheduler、runner、connector看到的 group顺序和block ID命名空间一致。
+9. positions、seq_lens和RoPE保持绝对序列语义。
+10. 长Prefill的全部query完成FA前，不得用最终尾窗覆盖其仍需读取的KV。
+11. private_num_blocks = 1 + (S + R) * blocks_per_request；local block 0 为 sentinel，request block 从 1 开始；在途引用归零前slot不可复用。
+12. dummy run产生的总KV预算只分配一次，private、shared及独立Prefill执行cache的实际字节之和不得超过该预算。</code></pre>
+
+  <div class="info"><strong>最终建议：</strong>把“每请求一个大 block”的需求实现为“每请求一个固定大小的 physical allocation + 按绝对位置寻址的逻辑长表”。第一版private pool按 <code>S+R</code>个slots创建并建议 <code>R=S</code>；dummy run后先预扣private及Prefill跨层batch buffer字节，再用余额求shared block数。Prefill完成FA后仅提交最后W个有效KV，Decode/Spec Decode直接增量写private pool并执行FA。该方案保留请求隔离、无prefix复用和PD尾窗传输语义。</div>
+
+  <p class="small">本文为实现设计稿，不包含功能代码。落地前应优先通过 CPU/mock manager测试验证生命周期与双 pool原子性，再在 Ascend NPU验证 DSA window mapping、speculative decoding、Decode ACLGraph和PD传输。</p>
+</body>
+</html>

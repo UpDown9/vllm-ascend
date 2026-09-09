@@ -110,6 +110,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to enable the experimental DeepSeek-V4 private SWA pool.
+    # Valid values: 0 (default, original pool/prefix-cache flow) or 1
+    # (compact private pool plus prefix-hit rollback by configured SWA window).
+    # Non-sensitive; read on scheduler/runner initialization and hot paths.
+    "VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL", "0"))),
 }
 
 # end-env-vars-definition

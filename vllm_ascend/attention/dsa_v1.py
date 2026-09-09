@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, ClassVar, TypeAlias
 
 import torch
@@ -15,6 +15,7 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, Atte
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend import envs
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -26,6 +27,9 @@ from vllm_ascend.attention.utils import (
     wait_for_kv_layer_from_connector,
 )
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.core.private_swa_pool import (
+    compute_private_swa_prefill_workspace_blocks,
+)
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_otp_group
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
@@ -57,6 +61,9 @@ BUILD_METADATA_STEP_PREFILL = 0
 BUILD_METADATA_STEP_DECODE = 1
 
 _DSV4_DSA_OVERLAP_STREAM = None
+# Prefill is eager and forwards are serialized. Keep one address-stable PA
+# workspace per engine/device/layout and share it across all DSV4 SWA layers.
+_DSV4_PREFILL_WORKSPACES: dict[tuple[int, str, torch.dtype, tuple[int, ...]], torch.Tensor] = {}
 
 
 def dsv4_dsa_overlap_stream() -> torch.npu.Stream:
@@ -258,6 +265,10 @@ class AscendDSAPrefillMetadata:
     qli_metadata: torch.Tensor = None
     cu_c4_cmp_seqlen_list: torch.Tensor = None
     cu_c128_cmp_seqlen_list: torch.Tensor = None
+    # Per-request prefix rollback boundaries. FA uses rollback_start;
+    # compressor/indexer persistence starts at persistent_start.
+    rollback_start: torch.Tensor | None = None
+    persistent_start: torch.Tensor | None = None
 
 
 @dataclass
@@ -863,12 +874,23 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             cos=cos,
             full_compress_sin=full_compress_sin,
             full_compress_cos=full_compress_cos,
-            start_pos=self.start_pos_prefill[:num_prefill],
+            # Compressor/indexer rollback writes resume at the original
+            # prefix-hit boundary H. FA/SWA keeps its independent R range.
+            start_pos=(
+                torch.where(
+                    (persistent := getattr(common_attn_metadata, "private_swa_persistent_start", None))[reqs_start:reqs_start + num_prefill] >= 0,
+                    persistent[reqs_start:reqs_start + num_prefill],
+                    self.start_pos_prefill[:num_prefill],
+                ) if getattr(common_attn_metadata, "private_swa_persistent_start", None) is not None
+                else self.start_pos_prefill[:num_prefill]
+            ),
             num_reqs_actual=num_prefills_actual,
             sas_metadata=sas_metadata,
             qli_metadata=qli_metadata,
             cu_c4_cmp_seqlen_list=cu_c4_cmp_seqlen_list,
             cu_c128_cmp_seqlen_list=cu_c128_cmp_seqlen_list,
+            rollback_start=((getattr(common_attn_metadata, "private_swa_rollback_start", None))[reqs_start:] if getattr(common_attn_metadata, "private_swa_rollback_start", None) is not None else None),
+            persistent_start=((getattr(common_attn_metadata, "private_swa_persistent_start", None))[reqs_start:] if getattr(common_attn_metadata, "private_swa_persistent_start", None) is not None else None),
         )
 
     def build_decode_metadata(
@@ -1485,17 +1507,36 @@ class AscendDSAImpl(DSAAttentionImpl):
             topk_indices = topk_indices.unsqueeze(1)
         return topk_indices
 
-    def _update_indexcache_topk_indices(self, topk_indices: torch.Tensor, offset: int = 0) -> None:
+    def _update_indexcache_topk_indices(
+        self,
+        topk_indices: torch.Tensor,
+        offset: int = 0,
+        token_indices: torch.Tensor | None = None,
+    ) -> None:
         if self.topk_indices_buffer is None:
             return
         num_tokens = topk_indices.shape[0]
         topk_tokens = topk_indices.shape[-1]
         topk_indices_to_cache = topk_indices
-        topk_indices_buffer = self.topk_indices_buffer[offset : offset + num_tokens, :topk_tokens]
+        if token_indices is None:
+            topk_indices_buffer = self.topk_indices_buffer[offset : offset + num_tokens, :topk_tokens]
+        else:
+            destination = token_indices.to(
+                device=self.topk_indices_buffer.device, dtype=torch.long
+            ) + offset
+            if destination.numel() != num_tokens:
+                raise RuntimeError(
+                    "IndexCache token index count does not match top-k rows: "
+                    f"{destination.numel()} != {num_tokens}"
+                )
+            topk_indices_buffer = self.topk_indices_buffer[:, :topk_tokens]
         if topk_indices_to_cache.dim() == 3 and topk_indices_buffer.dim() == 2:
             assert topk_indices_to_cache.shape[1] == 1
             topk_indices_to_cache = topk_indices_to_cache.squeeze(1)
-        topk_indices_buffer.copy_(topk_indices_to_cache)
+        if token_indices is None:
+            topk_indices_buffer.copy_(topk_indices_to_cache)
+        else:
+            topk_indices_buffer.index_copy_(0, destination, topk_indices_to_cache)
 
     def _compute_compressor_metadata(
         self,
@@ -1834,6 +1875,337 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         return q, qr, qr_pertoken_scale
 
+    def _prepare_private_swa_prefill(
+        self,
+        swa_kv_cache: torch.Tensor,
+        metadata: AscendDSAPrefillMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Restore W-1 history into a compact PA workspace for eager Prefill.
+
+        A long Prefill chunk cannot be scattered directly into the small
+        request-private ring: later writes can overwrite KV that an earlier
+        query in the same FA invocation still reads. This method constructs a
+        batch-local PA view containing [history | current chunk] per request.
+        """
+        if self.vllm_config.parallel_config.prefill_context_parallel_size != 1:
+            raise RuntimeError("DeepSeek-V4 private SWA Prefill does not support PCP")
+        if self.vllm_config.parallel_config.decode_context_parallel_size != 1:
+            raise RuntimeError("DeepSeek-V4 private SWA does not support DCP")
+
+        block_size = metadata.block_size
+        max_workspace_blocks = compute_private_swa_prefill_workspace_blocks(
+            max_num_batched_tokens=(
+                self.vllm_config.scheduler_config.max_num_batched_tokens
+            ),
+            max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
+            window_size=self.window_size,
+            block_size=block_size,
+        )
+        key = (id(self.vllm_config), str(swa_kv_cache.device), swa_kv_cache.dtype,
+               tuple(swa_kv_cache.shape[1:]))
+        workspace = _DSV4_PREFILL_WORKSPACES.get(key)
+        expected_shape = (max_workspace_blocks, *swa_kv_cache.shape[1:])
+        if workspace is None:
+            workspace = torch.empty(expected_shape, dtype=swa_kv_cache.dtype,
+                                    device=swa_kv_cache.device)
+            _DSV4_PREFILL_WORKSPACES[key] = workspace
+        elif tuple(workspace.shape) != expected_shape:
+            raise RuntimeError(
+                "DeepSeek-V4 Prefill workspace layout changed after initialization: "
+                f"expected={expected_shape}, actual={tuple(workspace.shape)}")
+
+        query_lens = metadata.query_lens.tolist()
+        seq_lens = metadata.seq_lens.tolist()
+        query_start_loc = metadata.query_start_loc.tolist()
+        num_reqs = len(query_lens)
+        draft_tokens = (getattr(self.vllm_config.speculative_config,
+                                "num_speculative_tokens", 0)
+                        if self.vllm_config.speculative_config is not None else 0)
+        capacity = self.window_size - 1 + 1 + draft_tokens
+        blocks_per_allocation = ((capacity + block_size - 1)
+                                 // block_size)
+
+        rollback_rows = set()
+        rollback_start = getattr(metadata, "rollback_start", None)
+        persistent_start = getattr(metadata, "persistent_start", None)
+        if rollback_start is not None and persistent_start is not None:
+            rollback_rows = {
+                i for i in range(min(rollback_start.numel(), persistent_start.numel()))
+                if int(rollback_start[i]) < int(persistent_start[i])
+            }
+
+        page_bases: list[int] = []
+        history_lens: list[int] = []
+        allocation_bases: list[int] = []
+        workspace_seq_lens: list[int] = []
+        next_page = 0
+        confirmed_lens: list[int] = []
+        for row, (query_len, seq_len) in enumerate(zip(query_lens, seq_lens)):
+            token_begin = int(query_start_loc[row])
+            confirmed = (int(metadata.input_positions[token_begin].item())
+                         if int(query_len) > 0 else int(seq_len))
+            if confirmed < 0 or confirmed + int(query_len) != int(seq_len):
+                raise RuntimeError(
+                    "inconsistent DeepSeek-V4 Prefill absolute positions: "
+                    f"row={row}, confirmed={confirmed}, query_len={query_len}, "
+                    f"seq_len={seq_len}")
+            confirmed_lens.append(confirmed)
+            # A prefix rollback has no private SWA history at [R, H).
+            # Keep history_len=0 so FA does not treat zero-filled workspace
+            # rows as valid keys; newly generated rollback tokens build their
+            # own history as the request progresses.
+            history_len = (
+                0 if row in rollback_rows
+                else min(self.window_size - 1, confirmed)
+            )
+            local_len = history_len + int(query_len)
+            pages = max(1, (local_len + block_size - 1) // block_size)
+            if next_page + pages > max_workspace_blocks:
+                raise RuntimeError(
+                    "DeepSeek-V4 Prefill workspace exhausted; scheduler batch "
+                    f"exceeds profiled capacity ({next_page + pages} > "
+                    f"{max_workspace_blocks} blocks)")
+            row_block_ids = metadata.block_table[row].tolist()
+            private_block = next((int(block_id) for block_id in row_block_ids
+                                 if int(block_id) > 0), -1)
+            if private_block < 1:
+                raise RuntimeError(
+                    f"private SWA block table row {row} has no real block")
+            allocation_base = (1 + ((private_block - 1) // blocks_per_allocation)
+                               * blocks_per_allocation)
+            page_bases.append(next_page)
+            history_lens.append(history_len)
+            allocation_bases.append(allocation_base)
+            workspace_seq_lens.append(local_len)
+            next_page += pages
+
+        private_flat = swa_kv_cache.flatten(0, 1)
+        workspace_flat = workspace.flatten(0, 1)
+        restore_src: list[int] = []
+        restore_dst: list[int] = []
+        current_dst: list[int] = []
+        commit_src: list[int] = []
+        commit_dst: list[int] = []
+        token_offset = 0
+        max_pages_per_req = max(1, max(
+            ((length + block_size - 1) // block_size
+             for length in workspace_seq_lens), default=1))
+        workspace_block_table = torch.zeros(
+            (num_reqs, max_pages_per_req), dtype=torch.int32,
+            device=swa_kv_cache.device)
+
+        for row, (query_len, seq_len) in enumerate(zip(query_lens, seq_lens)):
+            query_len = int(query_len)
+            seq_len = int(seq_len)
+            confirmed = confirmed_lens[row]
+            history_len = history_lens[row]
+            page_base = page_bases[row]
+            allocation_base = allocation_bases[row]
+            local_len = workspace_seq_lens[row]
+            pages = max(1, (local_len + block_size - 1) // block_size)
+            workspace_block_table[row, :pages] = torch.arange(
+                page_base, page_base + pages, dtype=torch.int32,
+                device=swa_kv_cache.device)
+
+            if row not in rollback_rows:
+                for j, absolute_pos in enumerate(range(confirmed - history_len,
+                                                       confirmed)):
+                    private_block = (absolute_pos // block_size) % blocks_per_allocation
+                    restore_src.append((allocation_base + private_block) * block_size
+                                       + absolute_pos % block_size)
+                    restore_dst.append(page_base * block_size + j)
+            current_dst.extend(page_base * block_size + history_len + j
+                               for j in range(query_len))
+
+            keep = min(self.window_size, local_len)
+            absolute_start = seq_len - keep
+            local_start = local_len - keep
+            for j in range(keep):
+                absolute_pos = absolute_start + j
+                private_block = (absolute_pos // block_size) % blocks_per_allocation
+                commit_src.append(page_base * block_size + local_start + j)
+                commit_dst.append((allocation_base + private_block) * block_size
+                                  + absolute_pos % block_size)
+            token_offset += query_len
+
+        if restore_src:
+            src = torch.tensor(restore_src, dtype=torch.long,
+                               device=swa_kv_cache.device)
+            dst = torch.tensor(restore_dst, dtype=torch.long,
+                               device=swa_kv_cache.device)
+            # Ascend's IndexSelect kernel does not support FP8 E4M3FN.  The
+            # SWA cache is byte-addressable for all cache dtypes, so gather
+            # bytes instead of applying index_select directly to FP8 values.
+            workspace_flat.view(torch.uint8).index_copy_(
+                0, dst, private_flat.view(torch.uint8).index_select(0, src))
+        current_slots = torch.tensor(current_dst, dtype=torch.int64,
+                                     device=swa_kv_cache.device)
+        formatted_slots = DeviceOperator.format_dsa_slot_mapping(
+            current_slots, block_size)
+        workspace_seq_lens_tensor = torch.tensor(
+            workspace_seq_lens, dtype=metadata.seq_lens.dtype,
+            device=metadata.seq_lens.device)
+        commit_state = {
+            "src": torch.tensor(commit_src, dtype=torch.long,
+                                device=swa_kv_cache.device),
+            "dst": torch.tensor(commit_dst, dtype=torch.long,
+                                device=swa_kv_cache.device),
+        }
+        return (workspace, formatted_slots, workspace_block_table,
+                workspace_seq_lens_tensor, commit_state)
+
+    def _private_swa_prefill_sas_metadata(
+        self,
+        metadata: AscendDSAPrefillMetadata,
+        workspace_seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build sparse-attention metadata for compact Prefill KV lengths."""
+        seq_lens_q = metadata.query_start_loc[1:] - metadata.query_start_loc[:-1]
+        if workspace_seq_lens.numel() != seq_lens_q.numel():
+            raise RuntimeError("private SWA workspace batch metadata mismatch")
+        metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()
+        metadata_kwargs = DeviceOperator.get_dsa_sparse_attn_metadata_kwargs(
+            workspace_seq_lens.device)
+        kwargs: dict[str, Any] = dict(
+            **metadata_kwargs,
+            num_heads_q=self.n_local_heads,
+            num_heads_kv=1,
+            head_dim=self.head_dim,
+            cu_seqlens_q=metadata.query_start_loc,
+            cu_seqlens_ori_kv=metadata.query_start_loc,
+            cu_seqlens_cmp_kv=(metadata.cu_c4_cmp_seqlen_list
+                               if self.compress_ratio == 4 else
+                               metadata.cu_c128_cmp_seqlen_list
+                               if self.compress_ratio == 128 else None),
+            seqused_q=metadata.query_lens.new_empty((0,)),
+            seqused_kv=workspace_seq_lens,
+            max_seqlen_q=seq_lens_q.max(),
+            max_seqlen_kv=workspace_seq_lens.max(),
+            batch_size=workspace_seq_lens.numel(),
+            cmp_ratio=max(self.compress_ratio, 1),
+            ori_mask_mode=4,
+            ori_win_left=self.window_size - 1,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_ND",
+            has_ori_kv=True,
+            has_cmp_kv=self.compress_ratio > 1,
+        )
+        if self.compress_ratio > 1:
+            kwargs["cmp_mask_mode"] = 3
+            if self.compress_ratio == 4:
+                kwargs["cmp_topk"] = self.index_topk
+        return metadata_op(**kwargs)
+
+    @staticmethod
+    def _commit_private_swa_prefill(
+        workspace: torch.Tensor,
+        swa_kv_cache: torch.Tensor,
+        commit_state: dict[str, torch.Tensor],
+    ) -> None:
+        """Commit only the post-chunk tail window to the private ring."""
+        src = commit_state["src"]
+        if src.numel() == 0:
+            return
+        workspace_flat = workspace.flatten(0, 1)
+        private_flat = swa_kv_cache.flatten(0, 1)
+        # Keep the copy lossless for quantized (FP8) SWA caches.  NPU
+        # index_select has no FP8 implementation, while uint8 views preserve
+        # the exact cache bytes and are supported by the kernel.
+        private_flat.view(torch.uint8).index_copy_(
+            0,
+            commit_state["dst"],
+            workspace_flat.view(torch.uint8).index_select(0, src),
+        )
+
+    def _build_private_swa_persistent_prefill_view(
+        self,
+        hidden_states: torch.Tensor,
+        metadata: AscendDSAPrefillMetadata,
+    ) -> tuple[torch.Tensor, AscendDSAPrefillMetadata, torch.Tensor | None]:
+        """Build the [H, P) view used by persistent compressor/indexer writes.
+
+        The model and FA execute the expanded [R, P) prefix-rollback range.
+        Compressor/indexer state and KV caches must only be updated for the
+        suffix beginning at the shared-cache boundary H.
+        """
+        rollback_start = metadata.rollback_start
+        persistent_start = metadata.persistent_start
+        if rollback_start is None or persistent_start is None:
+            return hidden_states, metadata, None
+
+        rollback_values = rollback_start.tolist()
+        persistent_values = persistent_start.tolist()
+        if not any(int(r) < int(p) for r, p in zip(rollback_values, persistent_values) if int(p) >= 0):
+            return hidden_states, metadata, None
+        if metadata.start_pos is None:
+            raise RuntimeError("private SWA persistent metadata is missing start_pos")
+
+        query_lens = [int(length) for length in metadata.query_lens.tolist()]
+        query_start_loc = [int(value) for value in metadata.query_start_loc.tolist()]
+        start_values = [int(value) for value in metadata.start_pos.tolist()]
+        token_indices: list[int] = []
+        persistent_lens: list[int] = []
+        persistent_starts: list[int] = []
+        for row, query_len in enumerate(query_lens):
+            token_begin = query_start_loc[row]
+            token_end = query_start_loc[row + 1]
+            if token_end - token_begin != query_len:
+                raise RuntimeError("private SWA Prefill query metadata is inconsistent")
+            if query_len == 0:
+                persistent_lens.append(0)
+                persistent_starts.append(start_values[row])
+                continue
+            actual_start = int(metadata.input_positions[token_begin].item())
+            target_start = (int(persistent_values[row])
+                            if int(persistent_values[row]) >= 0
+                            else start_values[row])
+            skip = target_start - actual_start
+            if skip < 0 or skip > query_len:
+                raise RuntimeError(
+                    "private SWA persistent range is outside the expanded Prefill range: "
+                    f"row={row}, expanded_start={actual_start}, target_start={target_start}, "
+                    f"query_len={query_len}"
+                )
+            token_indices.extend(range(token_begin + skip, token_end))
+            persistent_lens.append(query_len - skip)
+            persistent_starts.append(target_start)
+
+        index = torch.tensor(token_indices, dtype=torch.long, device=hidden_states.device)
+        persistent_hidden_states = hidden_states.index_select(0, index)
+        persistent_query_lens = torch.tensor(
+            persistent_lens, dtype=metadata.query_lens.dtype, device=metadata.query_lens.device
+        )
+        persistent_query_start_loc = torch.zeros(
+            len(persistent_lens) + 1, dtype=metadata.query_start_loc.dtype,
+            device=metadata.query_start_loc.device
+        )
+        persistent_query_start_loc[1:] = torch.cumsum(
+            persistent_query_lens.to(device=persistent_query_start_loc.device), dim=0
+        )
+        persistent_input_positions = metadata.input_positions.index_select(
+            0, index.to(device=metadata.input_positions.device)
+        )
+        persistent_start_pos = torch.tensor(
+            persistent_starts, dtype=metadata.start_pos.dtype, device=metadata.start_pos.device
+        )
+        total_tokens = sum(persistent_lens)
+        num_compressed_tokens = min(
+            total_tokens, total_tokens // max(self.compress_ratio, 1) + len(persistent_lens)
+        )
+        persistent_metadata = replace(
+            metadata,
+            query_lens=persistent_query_lens,
+            input_positions=persistent_input_positions,
+            query_start_loc=persistent_query_start_loc,
+            start_pos=persistent_start_pos,
+            num_compressed_tokens=num_compressed_tokens,
+            max_query_len=max(persistent_lens, default=0),
+            rollback_start=None,
+            persistent_start=None,
+        )
+        return persistent_hidden_states, persistent_metadata, index
+
     def _forward_prefill(
         self,
         layer_name,
@@ -1863,6 +2235,25 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         common_prefill_metadata = _require_prefill_metadata(compress_common_attn_metadata)
         swa_prefill_metadata = _require_prefill_metadata(swa_metadata)
+        private_swa_kv_cache = swa_kv_cache
+        if envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL:
+            (
+                swa_exec_kv_cache,
+                swa_exec_slot_mapping,
+                swa_exec_block_table,
+                swa_exec_seq_lens,
+                swa_commit_state,
+            ) = self._prepare_private_swa_prefill(
+                private_swa_kv_cache, swa_prefill_metadata)
+            swa_exec_sas_metadata = self._private_swa_prefill_sas_metadata(
+                common_prefill_metadata, swa_exec_seq_lens)
+        else:
+            swa_exec_kv_cache = swa_kv_cache
+            swa_exec_slot_mapping = swa_prefill_metadata.slot_mapping
+            swa_exec_block_table = swa_prefill_metadata.block_table
+            swa_exec_seq_lens = swa_prefill_metadata.seq_lens
+            swa_commit_state = None
+            swa_exec_sas_metadata = common_prefill_metadata.sas_metadata
         cos = common_prefill_metadata.cos[layer_name]
         sin = common_prefill_metadata.sin[layer_name]
         actual_seq_lengths_query = common_prefill_metadata.query_start_loc
@@ -1871,7 +2262,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         if self.multistream_dsv4_dsa_overlap:
             # mla prolog: q + kv dual-stream parallel
             q, qr, _ = self._mla_prolog_multistream(
-                hidden_states, cos, sin, swa_kv_cache, swa_prefill_metadata.slot_mapping, is_prefill=True
+                hidden_states, cos, sin, swa_exec_kv_cache, swa_exec_slot_mapping, is_prefill=True
             )
         else:
             # mlaprolog
@@ -1940,23 +2331,47 @@ class AscendDSAImpl(DSAAttentionImpl):
             )
 
             # swa exec kv
-            DeviceOperator.dsa_kv_compress_scatter(swa_kv_cache, kv, swa_prefill_metadata.slot_mapping)
+            DeviceOperator.dsa_kv_compress_scatter(
+                swa_exec_kv_cache, kv, swa_exec_slot_mapping)
 
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
         DeviceOperator.add_dsa_sparse_attn_extra_kwargs(extra_attn_kwargs, cu_seqlens_ori_kv=actual_seq_lengths_query)
 
+        # Prepare a separate compressed-KV length for prefix rollback rows by
+        # accounting for one additional SWA window. This is intentionally not
+        # wired into the FA operator yet.
+        seqused_cmp_kv = swa_exec_seq_lens
+        rollback_start = swa_prefill_metadata.rollback_start
+        persistent_start = swa_prefill_metadata.persistent_start
+        if rollback_start is not None and persistent_start is not None:
+            rollback_mask = (
+                (rollback_start >= 0)
+                & (persistent_start >= 0)
+                & (rollback_start < persistent_start)
+            ).to(device=swa_exec_seq_lens.device)
+            if rollback_mask.shape != swa_exec_seq_lens.shape:
+                raise RuntimeError(
+                    "private SWA rollback metadata does not match seqused_kv"
+                )
+            seqused_cmp_kv = torch.where(
+                rollback_mask,
+                swa_exec_seq_lens + self.window_size,
+                swa_exec_seq_lens,
+            )
+        if seqused_cmp_kv.shape != swa_exec_seq_lens.shape:
+            raise RuntimeError("invalid compressed-KV sequence lengths")
+
         if self.compress_ratio <= 1:
-            notify_kv_cache_written(layer_name)
             record_attention_compute_start()
-            return attn_op(
+            attn_output = attn_op(
                 q,
-                ori_kv=swa_kv_cache,
-                ori_block_table=swa_prefill_metadata.block_table,
+                ori_kv=swa_exec_kv_cache,
+                ori_block_table=swa_exec_block_table,
                 cu_seqlens_q=actual_seq_lengths_query,
-                seqused_kv=actual_seq_lengths_key,
+                seqused_kv=swa_exec_seq_lens,
                 sinks=self.attn_sink,
-                metadata=common_prefill_metadata.sas_metadata,
+                metadata=swa_exec_sas_metadata,
                 softmax_scale=self.softmax_scale,
                 cmp_ratio=max(self.compress_ratio, 1),
                 ori_mask_mode=4,
@@ -1966,6 +2381,11 @@ class AscendDSAImpl(DSAAttentionImpl):
                 layout_kv="PA_ND",
                 **extra_attn_kwargs,
             )[0]
+            if envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL:
+                self._commit_private_swa_prefill(
+                    swa_exec_kv_cache, private_swa_kv_cache, swa_commit_state)
+            notify_kv_cache_written(layer_name)
+            return attn_output
 
         if self.compress_ratio > 1:
             compressor_prefill_metadata = _require_prefill_metadata(compressor_attn_metadata)
@@ -2007,13 +2427,18 @@ class AscendDSAImpl(DSAAttentionImpl):
                         )
 
             coff = 2 if self.compressor_overlap else 1
+            persistent_hidden_states, persistent_compressor_metadata, persistent_indices = (
+                self._build_private_swa_persistent_prefill_view(
+                    hidden_states, compressor_prefill_metadata
+                )
+            )
             compress_cos, compress_sin, compress_slot_mapping = self._compute_compressor_metadata(
-                compressor_prefill_metadata,
+                persistent_compressor_metadata,
             )
 
             # Inline compressor + scatter (c128, c4 non-dual)
             compressed_kv = torch.ops._C_ascend.compressor(
-                hidden_states,
+                persistent_hidden_states,
                 self.compressor_wkv.weight,
                 self.compressor_wgate.weight,
                 state_cache.squeeze(-2),
@@ -2022,9 +2447,9 @@ class AscendDSAImpl(DSAAttentionImpl):
                 compress_sin.view(-1, compress_sin.shape[-1]),
                 compress_cos.view(-1, compress_cos.shape[-1]),
                 state_block_table=compressor_state_prefill_metadata.block_table,
-                cu_seqlens=actual_seq_lengths_query,
+                cu_seqlens=persistent_compressor_metadata.query_start_loc,
                 seqused=None,
-                start_pos=common_prefill_metadata.start_pos,
+                start_pos=persistent_compressor_metadata.start_pos,
                 rope_head_dim=self.rope_head_dim,
                 cmp_ratio=self.compress_ratio,
                 coff=coff,
@@ -2084,9 +2509,17 @@ class AscendDSAImpl(DSAAttentionImpl):
                 )
 
             if self.compress_ratio == 4 and self.use_index_cache:
-                self._update_indexcache_topk_indices(compress_topk_idxs, offset=prefill_offset)
+                cache_topk_idxs = compress_topk_idxs
+                if persistent_indices is not None:
+                    cache_topk_idxs = compress_topk_idxs.index_select(
+                        0, persistent_indices.to(device=compress_topk_idxs.device)
+                    )
+                self._update_indexcache_topk_indices(
+                    cache_topk_idxs,
+                    offset=prefill_offset,
+                    token_indices=persistent_indices,
+                )
 
-            notify_kv_cache_written(layer_name)
             record_attention_compute_start()
 
             if self.compress_ratio == 4:
@@ -2095,15 +2528,15 @@ class AscendDSAImpl(DSAAttentionImpl):
                 )
                 attn_output = attn_op(
                     q,
-                    ori_kv=swa_kv_cache,
+                    ori_kv=swa_exec_kv_cache,
                     cmp_kv=compress_kv_cache,
                     cmp_sparse_indices=compress_topk_idxs,
-                    ori_block_table=swa_prefill_metadata.block_table,
+                    ori_block_table=swa_exec_block_table,
                     cmp_block_table=compressor_prefill_metadata.block_table,
                     cu_seqlens_q=actual_seq_lengths_query,
-                    seqused_kv=actual_seq_lengths_key,
+                    seqused_kv=swa_exec_seq_lens,
                     sinks=self.attn_sink,
-                    metadata=common_prefill_metadata.sas_metadata,
+                    metadata=swa_exec_sas_metadata,
                     softmax_scale=self.softmax_scale,
                     cmp_ratio=self.compress_ratio,
                     ori_mask_mode=4,
@@ -2120,14 +2553,14 @@ class AscendDSAImpl(DSAAttentionImpl):
                 )
                 attn_output = attn_op(
                     q,
-                    ori_kv=swa_kv_cache,
+                    ori_kv=swa_exec_kv_cache,
                     cmp_kv=compress_kv_cache,
-                    ori_block_table=swa_prefill_metadata.block_table,
+                    ori_block_table=swa_exec_block_table,
                     cmp_block_table=compressor_prefill_metadata.block_table,
                     cu_seqlens_q=actual_seq_lengths_query,
-                    seqused_kv=actual_seq_lengths_key,
+                    seqused_kv=swa_exec_seq_lens,
                     sinks=self.attn_sink,
-                    metadata=common_prefill_metadata.sas_metadata,
+                    metadata=swa_exec_sas_metadata,
                     softmax_scale=self.softmax_scale,
                     cmp_ratio=self.compress_ratio,
                     ori_mask_mode=4,
@@ -2138,6 +2571,11 @@ class AscendDSAImpl(DSAAttentionImpl):
                     layout_kv="PA_ND",
                     **extra_attn_kwargs,
                 )[0]
+        # Publish the new tail only after FA has consumed the compact workspace.
+        if envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL:
+            self._commit_private_swa_prefill(
+                swa_exec_kv_cache, private_swa_kv_cache, swa_commit_state)
+        notify_kv_cache_written(layer_name)
         return attn_output
 
     def _forward_decode(
@@ -2498,14 +2936,22 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         q = rotate_activation(q, indexer_kv_scale_metadata.hadamard)
         coff = 2 if self.compressor_overlap else 1
+        compressor_x = x
+        compressor_query_start_loc = actual_seq_lengths_query
 
         if with_prefill:
             indexer_state_prefill_metadata = _require_prefill_metadata(indexer_kv_state_metadata)
             indexer_scale_prefill_metadata = _require_prefill_metadata(indexer_kv_scale_metadata)
+            compressor_x, persistent_scale_metadata, _ = (
+                self._build_private_swa_persistent_prefill_view(
+                    x, indexer_scale_prefill_metadata
+                )
+            )
+            compressor_query_start_loc = persistent_scale_metadata.query_start_loc
             kv_block_table = indexer_state_prefill_metadata.block_table
-            start_pos = indexer_scale_prefill_metadata.start_pos
+            start_pos = persistent_scale_metadata.start_pos
             compressed_cos, compressed_sin, indexer_slot_mapping = self._compute_compressor_metadata(
-                indexer_scale_prefill_metadata,
+                persistent_scale_metadata,
             )
         else:
             indexer_state_decode_metadata = _require_decode_metadata(indexer_kv_state_metadata)
@@ -2517,7 +2963,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             )
 
         kv = torch.ops._C_ascend.compressor(
-            x,
+            compressor_x,
             self.indexcom_wkv.weight,
             self.indexcom_wgate.weight,
             indexer_state_cache.squeeze(-2),
@@ -2526,7 +2972,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             compressed_sin.view(-1, compressed_sin.shape[-1]),
             compressed_cos.view(-1, compressed_cos.shape[-1]),
             state_block_table=kv_block_table,
-            cu_seqlens=actual_seq_lengths_query,
+            cu_seqlens=compressor_query_start_loc,
             seqused=None,
             start_pos=start_pos,
             rope_head_dim=self.rope_head_dim,
@@ -2728,22 +3174,32 @@ class AscendDSAImpl(DSAAttentionImpl):
         if with_prefill:
             indexer_state_prefill_metadata = _require_prefill_metadata(indexer_kv_state_metadata)
             indexer_scale_prefill_metadata = _require_prefill_metadata(indexer_kv_scale_metadata)
-            kv_block_table = indexer_state_prefill_metadata.block_table
-            start_pos = indexer_scale_prefill_metadata.start_pos
-            compressed_cos, compressed_sin, slot_mapping_indexer = self._compute_compressor_metadata(
-                indexer_scale_prefill_metadata,
+            # Indexer queries cover the complete expanded [R, P) range, while
+            # compressor/state/cache writes resume at the prefix boundary H.
+            compressor_x, persistent_scale_metadata, _ = (
+                self._build_private_swa_persistent_prefill_view(
+                    x, indexer_scale_prefill_metadata
+                )
             )
+            kv_block_table = indexer_state_prefill_metadata.block_table
+            start_pos = persistent_scale_metadata.start_pos
+            compressed_cos, compressed_sin, slot_mapping_indexer = self._compute_compressor_metadata(
+                persistent_scale_metadata,
+            )
+            compressor_query_start_loc = persistent_scale_metadata.query_start_loc
         else:
             indexer_state_decode_metadata = _require_decode_metadata(indexer_kv_state_metadata)
             indexer_scale_decode_metadata = _require_decode_metadata(indexer_kv_scale_metadata)
+            compressor_x = x
             kv_block_table = indexer_state_decode_metadata.block_table
             start_pos = indexer_scale_decode_metadata.start_pos
             compressed_cos, compressed_sin, slot_mapping_indexer = self._compute_compressor_metadata(
                 indexer_scale_decode_metadata,
             )
+            compressor_query_start_loc = actual_seq_lengths_query
 
         kv = torch.ops._C_ascend.compressor(
-            x,
+            compressor_x,
             self.indexcom_wkv.weight,
             self.indexcom_wgate.weight,
             indexer_state_cache.squeeze(-2),
@@ -2752,7 +3208,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             compressed_sin.view(-1, compressed_sin.shape[-1]),
             compressed_cos.view(-1, compressed_cos.shape[-1]),
             state_block_table=kv_block_table,
-            cu_seqlens=actual_seq_lengths_query,
+            cu_seqlens=compressor_query_start_loc,
             seqused=None,
             start_pos=start_pos,
             rope_head_dim=self.rope_head_dim,

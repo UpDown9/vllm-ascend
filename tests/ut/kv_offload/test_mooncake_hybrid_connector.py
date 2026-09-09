@@ -21,6 +21,11 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector import
     KVCacheRecvingThread,
     MooncakeConnectorScheduler,
 )
+from vllm_ascend.core.private_swa_pool import (  # noqa: E402
+    PRIVATE_SWA_TRANSFER_FAILED,
+    PRIVATE_SWA_TRANSFER_READY,
+    PRIVATE_SWA_TRANSFER_RECEIVING,
+)
 
 
 class MockRequest:
@@ -52,7 +57,30 @@ class TestHybridKVCacheRecvingThreadDispatch(unittest.TestCase):
         thread.request_task_counts = defaultdict(int)
         thread.finished_request_markers = set()
         thread.request_task_counts_lock = threading.Lock()
+        thread.failed_recv_requests = set()
+        thread.invalid_block_ids = set()
+        thread.failed_recv_requests_lock = threading.Lock()
+        thread.private_swa_group_layouts = {"1": {}}
+        thread.task_tracker = MagicMock()
+        thread.proc_not_transfer_request = {}
+        thread.proc_not_transfer_request_lock = threading.Lock()
+        thread.request_queue = MagicMock()
+        thread.use_hybrid = True
+        thread._send_done_signal_to_free_remote_port = MagicMock()
+        thread._send_done_recv_signal = MagicMock()
         return thread
+
+    @staticmethod
+    def _recv_meta(all_task_done: bool) -> dict[str, Any]:
+        return {
+            "request_id": "request-1",
+            "remote_request_id": "remote-request-1",
+            "remote_host": "host-a",
+            "remote_handshake_port": 6000,
+            "remote_port_send_num": {},
+            "local_block_ids": ([10, 11], [200, 201]),
+            "all_task_done": all_task_done,
+        }
 
     def test_executor_workers_bind_kv_cache_device_before_handling_requests(self):
         expected_device = torch.device("npu:5")
@@ -233,6 +261,32 @@ class TestHybridKVCacheRecvingThreadDispatch(unittest.TestCase):
         self.assertIn(peer_key, thread.active_peer_request_handlers)
         thread.executor.submit.assert_called_once_with(thread._handle_peer_requests, peer_key)
 
+    def test_transfer_failure_is_reported_and_remaining_pulls_are_skipped(self):
+        thread = self._make_thread()
+        thread._transfer_kv_cache_all_groups = MagicMock(
+            side_effect=RuntimeError("transfer failed")
+        )
+        first_pull = self._recv_meta(all_task_done=False)
+        last_pull = self._recv_meta(all_task_done=True)
+        thread._mark_request_task_submitted(first_pull)
+        thread._mark_request_task_submitted(last_pull)
+
+        thread._handle_request(first_pull)
+        self.assertTrue(thread._is_failed_recv_request("request-1"))
+        thread._handle_request(last_pull)
+
+        thread._transfer_kv_cache_all_groups.assert_called_once_with(first_pull)
+        self.assertFalse(thread._is_failed_recv_request("request-1"))
+        self.assertEqual(
+            thread.get_and_clear_invalid_block_ids(),
+            {10, 11},
+        )
+        self.assertEqual(thread.invalid_block_ids, set())
+        thread.task_tracker.update_done_task_count.assert_called_once_with(
+            "request-1"
+        )
+        self.assertEqual(thread.request_queue.task_done.call_count, 2)
+
 
 class TestMooncakeHybridConnectorScheduler(unittest.TestCase):
     def _make_scheduler(self):
@@ -243,6 +297,10 @@ class TestMooncakeHybridConnectorScheduler(unittest.TestCase):
         scheduler.group_block_size = [128, 128]
         scheduler.group_compress_ratio = [4, 1]
         scheduler._reqs_need_send = {}
+        scheduler._reqs_need_recv = {}
+        scheduler._private_swa_receiving_requests = {}
+        scheduler._reqs_in_batch = set()
+        scheduler.private_swa_group_ids = frozenset({1})
         scheduler.block_size = 128
         scheduler.engine_id = "engine"
         scheduler.side_channel_host = "127.0.0.1"
@@ -276,6 +334,129 @@ class TestMooncakeHybridConnectorScheduler(unittest.TestCase):
         self.assertEqual(params["remote_block_ids"], ([0], [100, 101]))
         self.assertEqual(params["num_prompt_blocks"], 2)
         self.assertIn("req1", scheduler._reqs_need_send)
+
+    def test_private_swa_receive_records_exact_import_and_match_group(self):
+        scheduler = self._make_scheduler()
+        scheduler._validate_private_layout = MagicMock()
+        scheduler._private_page_ids = MagicMock(
+            return_value=[200, 201, 202, 203]
+        )
+        private_layout = {
+            "window_start": 128,
+            "valid_length": 256,
+            "window_size": 128,
+        }
+        request = MockRequest(
+            "req1",
+            prompt_token_ids=list(range(257)),
+            kv_transfer_params={
+                "do_remote_prefill": True,
+                "remote_block_ids": ([30, 31], [40, 41, 42, 43]),
+                "remote_engine_id": "remote-engine",
+                "remote_host": "remote-host",
+                "remote_port": 12345,
+                "remote_request_id": "remote-req1",
+                "private_swa_layout": private_layout,
+            },
+            status=RequestStatus.WAITING,
+        )
+        request.num_computed_tokens = 0
+        request.private_swa_allocation = 3
+        blocks = MagicMock()
+        blocks.get_unhashed_block_ids_all_groups.return_value = (
+            [10, 11],
+            [],
+        )
+
+        scheduler.update_state_after_alloc(
+            request, blocks, num_external_tokens=256
+        )
+
+        self.assertEqual(
+            request.private_swa_transfer_state,
+            PRIVATE_SWA_TRANSFER_RECEIVING,
+        )
+        self.assertEqual(request.private_swa_imported_window_start, 128)
+        self.assertEqual(request.private_swa_imported_valid_length, 256)
+        self.assertEqual(
+            request.private_swa_transfer_shared_block_ids,
+            frozenset({10, 11}),
+        )
+        _, local_block_ids, external_tokens = scheduler._reqs_need_recv[
+            "req1"
+        ]
+        self.assertEqual(local_block_ids, ([10, 11], [200, 201, 202, 203]))
+        self.assertEqual(external_tokens, 256)
+
+    def test_private_swa_receive_rejects_incomplete_import(self):
+        scheduler = self._make_scheduler()
+        scheduler._validate_private_layout = MagicMock()
+        scheduler._private_page_ids = MagicMock(return_value=[200, 201])
+        request = MockRequest(
+            "req1",
+            prompt_token_ids=list(range(257)),
+            kv_transfer_params={
+                "do_remote_prefill": True,
+                "remote_block_ids": ([30, 31], [40, 41]),
+                "remote_engine_id": "remote-engine",
+                "remote_host": "remote-host",
+                "remote_port": 12345,
+                "remote_request_id": "remote-req1",
+                "private_swa_layout": {
+                    "window_start": 128,
+                    "valid_length": 255,
+                    "window_size": 128,
+                },
+            },
+            status=RequestStatus.WAITING,
+        )
+        request.num_computed_tokens = 0
+        request.private_swa_allocation = 3
+        blocks = MagicMock()
+        blocks.get_unhashed_block_ids_all_groups.return_value = (
+            [10, 11],
+            [],
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, "does not cover the expected prefix"
+        ):
+            scheduler.update_state_after_alloc(
+                request, blocks, num_external_tokens=256
+            )
+
+    def test_private_swa_receive_completion_publishes_ready_or_failed(self):
+        scheduler = self._make_scheduler()
+        ready_request = types.SimpleNamespace(
+            request_id="ready",
+            private_swa_transfer_shared_block_ids=frozenset({10, 11}),
+            private_swa_transfer_state=PRIVATE_SWA_TRANSFER_RECEIVING,
+        )
+        failed_request = types.SimpleNamespace(
+            request_id="failed",
+            private_swa_transfer_shared_block_ids=frozenset({20, 21}),
+            private_swa_transfer_state=PRIVATE_SWA_TRANSFER_RECEIVING,
+        )
+        scheduler._private_swa_receiving_requests = {
+            "ready": ready_request,
+            "failed": failed_request,
+        }
+        connector_output = types.SimpleNamespace(
+            finished_recving={"ready", "failed"},
+            invalid_block_ids={20},
+        )
+
+        scheduler.update_connector_output(connector_output)
+
+        self.assertEqual(
+            ready_request.private_swa_transfer_state,
+            PRIVATE_SWA_TRANSFER_READY,
+        )
+        self.assertEqual(
+            failed_request.private_swa_transfer_state,
+            PRIVATE_SWA_TRANSFER_FAILED,
+        )
+        self.assertEqual(scheduler._private_swa_receiving_requests, {})
 
     def test_request_finished_uses_num_prompt_tokens(self):
         scheduler = self._make_scheduler()

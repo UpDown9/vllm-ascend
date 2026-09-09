@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Private SWA Pool / Rollback-128 代码检视报告</title>
+<style>
+  :root {
+    --bg: #f6f8fa;
+    --card: #ffffff;
+    --border: #d0d7de;
+    --text: #1f2328;
+    --muted: #57606a;
+    --red: #cf222e;
+    --red-bg: #fff1f0;
+    --orange: #bc4c00;
+    --orange-bg: #fff8eb;
+    --yellow: #9a6700;
+    --yellow-bg: #fffdf0;
+    --blue: #0969da;
+    --blue-bg: #ddf4ff;
+    --green: #1a7f37;
+    --green-bg: #dafbe1;
+    --code-bg: #f0f2f5;
+  }
+  body {
+    font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+    padding: 2rem 1rem;
+    line-height: 1.7;
+  }
+  .container { max-width: 1000px; margin: 0 auto; }
+  header {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.5rem 2rem;
+    margin-bottom: 2rem;
+  }
+  h1 { font-size: 1.5rem; margin: 0 0 0.5rem 0; }
+  header .meta { color: var(--muted); font-size: 0.9rem; }
+  h2 {
+    font-size: 1.25rem;
+    border-bottom: 2px solid var(--border);
+    padding-bottom: 0.4rem;
+    margin-top: 2.5rem;
+  }
+  h3 { font-size: 1.05rem; margin: 1.5rem 0 0.5rem 0; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem 1.5rem;
+    margin: 1rem 0;
+  }
+  .issue {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-left: 5px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin: 1rem 0;
+  }
+  .issue.critical { border-left-color: var(--red); background: var(--red-bg); }
+  .issue.major    { border-left-color: var(--orange); background: var(--orange-bg); }
+  .issue.decision { border-left-color: var(--yellow); background: var(--yellow-bg); }
+  .issue.minor    { border-left-color: var(--blue); background: var(--blue-bg); }
+  .issue.ok       { border-left-color: var(--green); background: var(--green-bg); }
+  .issue h4 { margin: 0 0 0.4rem 0; font-size: 1rem; }
+  .tag {
+    display: inline-block;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.1rem 0.6rem;
+    border-radius: 10px;
+    margin-right: 0.5rem;
+    vertical-align: middle;
+  }
+  .tag.critical { background: var(--red); color: #fff; }
+  .tag.major    { background: var(--orange); color: #fff; }
+  .tag.decision { background: var(--yellow); color: #fff; }
+  .tag.minor    { background: var(--blue); color: #fff; }
+  .tag.ok       { background: var(--green); color: #fff; }
+  code {
+    font-family: "SF Mono", "JetBrains Mono", Consolas, monospace;
+    background: var(--code-bg);
+    border-radius: 4px;
+    padding: 0.1rem 0.35rem;
+    font-size: 0.88em;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; }
+  ul { padding-left: 1.4rem; margin: 0.5rem 0; }
+  li { margin: 0.3rem 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1rem 0;
+    font-size: 0.92rem;
+    background: var(--card);
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 0.5rem 0.75rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--code-bg); }
+  .summary-box {
+    background: var(--blue-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem 1.5rem;
+    margin: 1.5rem 0;
+  }
+  .muted { color: var(--muted); }
+  .file-ref { color: var(--blue); font-size: 0.88em; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <h1>Private SWA Pool / Rollback-128 链路代码检视报告</h1>
+  <div class="meta">
+    检视对象：vllm-ascend 分支 <code>swa_private_pool</code> 未提交改动
+    （9 个修改文件 + 3 个新文件，约 +1500 行）<br>
+    检视方式：以代码实现为准（含 <code>csrc/attention/</code> 下 compressor / compressor_metadata /
+    sparse_attn_sharedkv kernel 源码交叉验证），文档仅作参考。<br>
+    复核更新（第二轮）：B1 已通过 persistent [H,P) 子批方案修复并经 kernel 源码逐项核实；
+    新增 B1b（压缩注意力范围截断）；A2 复核确认仍未修复；B3 已随 B1 修复结构性解决。<br>
+    复核更新（第三轮）：A1 已修复——回退触发搬进 <code>get_computed_blocks</code> 通用补丁 +
+    调度差值兜底 + rollback 行 history_len=0 三层结构，经逐层核实；B2（零历史计入 softmax）
+    随 A1 修复一并解决（零填充方案被移除）；A3 不受影响仍然存在。<br>
+    复核更新（第四轮）：A2 已修复——workspace 容量公式集中为单一函数（两调用点共用），
+    每请求项改为 W+bs-1，正确性依赖 A1 的 rollback 行无 history 不变量，回归测试覆盖旧 bug
+    构造与新公式紧确界。<br>
+    复核更新（第五轮）：A3 已修复——决策为传输优先（transfer wins）：D 侧传输状态机 +
+    READY 覆盖复检 + 清空 provisional rollback，recompute_scheduler else 分支删除，
+    FAILED 降级为 warm-up 回退。<br>
+    复核更新（第六轮）：A4 已修复（本会话实施最小修复：replace 前捕获、replace 后重挂载，
+    Python 模拟验证通过）；A3 复核补充发现 <code>_patched_handle_invalid_blocks</code>
+    第二层防线（无法归因的失效块一律全 fail 所有接收中请求），部分缓解 FAILED 检测盲区。
+    上线前必修项收敛为 B1b。<br>
+    复核更新（第七轮）：A5 已修复（set_private_swa_allocations 每次调用重置列表，泄漏消除）；
+    B1b 复核确认仍存在（seqused_kv 仍传 workspace 口径，:2077/:2338/:2503/:2527），
+    属性为纯精度损失、无功能报错（详见 B1b 卡片风险定性）。遗留清理项：A5 死代码删除。<br>
+    复核更新（第八轮 · 社区 v0.23.0 兼容性检查）：对照 /home/xujiuxu/code/PD_project/vllm（v0.23.0）
+    检查最新提交（b1ccb9638，含未提交工作区修改）的全部上游接口触碰面。发现 C1（allocate_new_computed_blocks
+    调用两个 gitee-only 方法，v0.23.0 上首次前缀命中即 AttributeError，最严重）、C2（remove_skipped_blocks
+    签名修复未提交）、C3（版本绑定确认 v0.23.0）、C4（pop_blocks_for_free 已删未提交）、
+    C5（invalid_blocks 两处请求挂死缺口）。详见"社区版本兼容性检查"章节。<br>
+    复核更新（第九轮 · C 系列复核）：新提交 a4646ab3e（工作区干净）——C1 已修复（改回单一 4 参上游调用 +
+    接口一致性测试）、C2 已修复并提交（2 参 + 测试）、C4 已删除提交、C5 缺口 A 已修复
+    （私有池开启时强制 recompute_kv_load_failures=False，加载失败按 terminal 处理，杜绝挂死）、
+    缺口 B 残留（混合失效场景，仅 ascend_store 类来源可触发）；C3 经三份接口测试确认绑定 v0.23.0。
+    另发现 B1b 修复脚手架已出现（seqused_cmp_kv = workspace + W，dsa_v1.py:2347-2350），
+    但注释明示"intentionally not wired into the FA operator yet"——<b>仍未修复</b>。<br>
+    结论概要（当前状态，经九轮复核）：<b>首轮 A1-A5/B1-B3 全部修复并核实；C 系列除 C5 缺口 B（边界残留）
+    外全部修复；唯一遗留必修项为 B1b（压缩注意力范围截断，纯精度损失，脚手架已有、接线未完成）。</b>
+  </div>
+</header>
+
+<div class="summary-box">
+  <b>优先级总览（含复核更新）</b>
+  <ul>
+    <li><b>已修复（复核确认）：</b>B1（压缩槽位错位）——persistent [H,P) 子批方案，kernel 级核实通过；
+        A1（非 D 节点静默污染）——三层触发结构，逐层核实通过；A2（workspace 容量漏算）——公式集中化 +
+        W+bs-1 项，正确性依赖 A1 不变量；A3（传输 vs 回退冲突）——传输优先决策 + 状态机；
+        A4（replace 丢元数据）——最小修复，模拟验证通过；A5（列表无界增长）——每步重置，泄漏消除；
+        B2（零历史计入 softmax）——随 A1 修复解决；B3——随 B1 修复结构性解决；
+        C1（gitee-only 方法调用）——改回单一 4 参上游调用 + 接口测试；C2（3 参签名）——已修提交；
+        C4（pop_blocks_for_free）——已删提交；C5 缺口 A（recompute 挂死）——强制 fail 策略杜绝</li>
+    <li><b>上线前必须解决：</b>B1b（压缩注意力范围截断）<b>——唯一遗留必修项；纯精度损失、无功能报错
+        （静默）；脚手架已出现（seqused_cmp_kv = workspace + W，dsa_v1.py:2347-2350）但注释明示
+        "intentionally not wired into the FA operator yet"，接线未完成</b></li>
+    <li><b>边界残留：</b>C5 缺口 B（混合失效场景误伤/漏调整，仅 ascend_store 类 invalid_block_ids 来源
+        可触发）</li>
+    <li><b>工程项：</b>A6、B4、B5（B5 已给出方案）；清理项：A5 死代码删除；
+        版本锁定：C3（运行环境须 vllm==0.23.0，三份接口测试已固化该绑定）</li>
+  </ul>
+</div>
+
+<h2>A. 私有池链路（Private Pool）</h2>
+
+<div class="issue ok">
+  <h4><span class="tag ok">已修复 · 复核确认</span>A1. 非 D 节点上前缀命中会读到未初始化显存</h4>
+  <p><b>原问题</b>：回退元数据只在 <code>RecomputeScheduler.schedule()</code>（仅 D 节点
+     recompute_scheduler_enable=true 时激活，P 节点被 platform.py:694-712 强制关闭）里生成。
+     standalone / P 节点前缀命中时 <code>effective_start</code> 恒为 None → 回退长度 0 →
+     请求被判为"环里有历史"走 restore 分支——而该请求的私有 allocation 从未写入
+     （<code>torch.empty</code> 裸内存或复用刚释放 allocation 里上一个请求的陈旧 KV）→
+     FA 把垃圾当合法历史参与 softmax，纯静默数值污染；P 节点还会经 mooncake 把污染 KV 传给 D。</p>
+  <p><b>修复结构（三层）</b>——正是"把触发搬进通用调度路径"的方案：</p>
+  <table>
+    <thead><tr><th style="width:16%">层</th><th style="width:42%">实现</th><th>核实结果</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>主修复</td>
+        <td><code>_patched_get_computed_blocks</code>
+            (<code class="file-ref">patch_async_swa_kv_lifetime.py:111-127</code>)：
+            挂在 <code>KVCacheManager.get_computed_blocks</code> 上，对所有 Scheduler 实现生效；
+            首次调度（<code>was_uncomputed</code>）且本地命中 H&gt;0 时记录
+            <code>original_hit=H, effective_start=max(0,H-W)</code></td>
+        <td>standalone / P 节点均触发 ✓；preempt-resume（num_computed 归零）重新触发 ✓；
+            不再依赖 RecomputeScheduler ✓</td>
+      </tr>
+      <tr>
+        <td>兜底</td>
+        <td><code>detect_new_prefix_hit_length</code>
+            (<code class="file-ref">private_swa_pool.py:88-109</code>，在
+            <code>_patched_update_after_schedule</code> 内调用)：基于调度前后
+            <code>num_computed_tokens</code> 差值二次检测，覆盖外部 connector 命中（含异步加载）</td>
+        <td><code>WAITING_FOR_REMOTE_KVS</code> 枚举存在（vLLM request.py:328）✓；
+            新请求按最终 confirmed（local+external）重记录，与第 1 层幂等 ✓；
+            chunk-2+ 正确返回 None 不误触发 ✓；等待期每步幂等刷新 ✓</td>
+      </tr>
+      <tr>
+        <td>消费端</td>
+        <td>rollback 行 <code>history_len=0</code>
+            (<code class="file-ref">dsa_v1.py:1953-1956</code>)，不从环里 restore；
+            旧版 <code>workspace_flat.zero_()</code> 整体移除</td>
+        <td>standalone 命中请求满足 <code>rollback_start(H-128) &lt; persistent_start(H)</code>
+            → rollback 行 → 根本不读环 ✓；restore 分支只服务 chunk-2+（环里确有本请求
+            上一块 commit 的数据）✓</td>
+      </tr>
+    </tbody>
+  </table>
+  <p><b>判定矩阵（全部修复）</b>：standalone ✓ ｜ P 节点 ✓（自身完成 warm-up，传给 D 的不再是污染数据）
+     ｜ D + recompute ✓（原有）｜ D 无 recompute ✓（经第 2 层兜底覆盖）。</p>
+  <p><b>连带效果</b>：B2（零历史计入 softmax）一并解决——回退行不再有零填充历史区，
+     窗口掩码只覆盖实际存在的 token，与设计文档的 position-based mask 要求一致。</p>
+  <p><b>遗留缺口（不构成 A1 主体，需知晓）</b>：</p>
+  <ul>
+    <li>防御层未实现：acquire 侧清零、<code>initialize_kv_cache_tensors</code> 一次性清零、
+        块 0 哨兵清零均未做——合法路径已不读空环，但未来新增"confirmed&gt;0 且无触发"路径
+        （状态名变更、新 connector 类型）时仍会静默读垃圾；fail-fast 校验也未添加；</li>
+    <li>A3 已另行修复（传输优先决策 + 状态机，见 A3 卡片）——修复前 D 节点 mooncake 传输的精确 KV
+        会被回退重算覆盖，现 READY 请求直接消费传输数据。</li>
+  </ul>
+</div>
+
+<div class="issue ok">
+  <h4><span class="tag ok">已修复 · 复核确认</span>A2. Prefill workspace 容量公式漏掉回退 token</h4>
+  <p><b>原问题</b>：workspace 张量与容量检查按 <code>max_bt + max_num_seqs*(W-1+bs-1)</code> 分配，
+     漏掉回退项——runner 侧自身 buffer 扩了 <code>W*max_num_seqs</code> 但 workspace 两处公式未同步。
+     多请求同批命中前缀时 <code>next_page + pages &gt; max_workspace_blocks</code> 必然触发
+     RuntimeError，且张量本身分配小了，运行时绕不过去（W=128、max_num_seqs=512 时缺口约 6.5 万 token）。</p>
+  <p><b>修复结构</b>：</p>
+  <ul>
+    <li><b>公式集中化</b>：新增 <code>compute_private_swa_prefill_workspace_blocks</code>
+        (<code class="file-ref">private_swa_pool.py:112-135</code>)，运行时分配/容量检查
+        (<code class="file-ref">dsa_v1.py:1896、1963</code>) 与内存规划预留
+        (<code class="file-ref">patch_kv_cache_utils.py:355、365</code>) <b>共用同一函数</b>——
+        首轮指出的"两处公式各自维护、易漂移"隐患一并消除。每请求项从
+        <code>W-1+bs-1</code> 改为 <code>W+bs-1</code>。</li>
+    <li><b>正确性</b>（复核逐项验证）：关键不变量为<b>每请求瞬态增量 = max(W-1 history, W rollback)，
+        不是两者之和</b>：
+        <pre><code>need = Σ ceil((hist_i + rb_i + new_i)/bs)
+     ≤ (Σ(hist+rb) + Σnew + S(bs-1)) / bs
+     ≤ (S·W + max_bt + S(bs-1)) / bs        ← 每请求 hist+rb ≤ W
+capacity = ceil((max_bt + S(W+bs-1))/bs) ≥ need ✓</code></pre>
+        不变量成立<b>依赖 A1 修复</b>（rollback 行 <code>history_len=0</code>）：rollback 行 hist=0、rb≤W；
+        非 rollback 行 rb=0、hist≤W-1——互斥，每请求瞬态 ≤ W。旧代码 rollback 行也带 history（≤W-1），
+        瞬态为 2W-1，公式才缺 <code>max_seqs*W</code>。</li>
+    <li><b>回归测试已补</b>（<code class="file-ref">tests/ut/core/test_private_swa_pool.py:55-84</code>）：
+        max_bt=2048、S=32、W=128、bs=32，构造 1 个 q=2017 + 31 个 q=1 的全回退批——
+        断言 <code>旧公式=222 &lt; 需要=新公式=223</code>，同时证明旧 bug 与新公式的紧确界（构造达到精确等号）。
+        首轮崩溃构造（32×rb=128+new=2）现在需 64 页 vs 容量 80 页 ✓。</li>
+  </ul>
+  <p><b>附带观察（耦合告警）</b>：A2 的正确性建立在 A1 的 <code>history_len=0</code> 之上——
+     若将来为消灭 B2 剩余的窗口截断近似而恢复 rollback 行的 history，A2 会立即复发且公式无告警。
+     建议在 <code>compute_private_swa_prefill_workspace_blocks</code> docstring 显式声明
+     "依赖 rollback 行无 history；若恢复需改为 2W-1 项"（现已写一半）。</p>
+</div>
+
+<div class="issue ok">
+  <h4><span class="tag ok">已修复 · 复核确认（决策：传输优先）</span>A3. D 节点：传输来的精确私有 KV 被 rollback 重算覆盖</h4>
+  <p><b>原问题</b>：Mooncake P 侧把私有环窗口页完整传给 D，但 D 侧 RecomputeScheduler else 分支无条件设
+     <code>effective_start = H-128</code> → 零历史回退重算 → commit 覆写 <code>[P-128, P)</code>——
+     传输的精确 KV 被近似值覆盖（P=H+1 时 127/128 被覆写），带宽纯浪费且相比老共享池方案数值回归。</p>
+  <p><b>修复决策</b>：<b>传输优先（transfer wins）</b>——READY 请求直接消费 P 生成的 SWA；
+     rollback 降级为故障回退路径。修复结构（逐项核实）：</p>
+  <table>
+    <thead><tr><th style="width:22%">环节</th><th style="width:42%">实现</th><th>核实结果</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>D 侧传输状态机</td>
+        <td><code>get_schedule_block_ids</code>（<code class="file-ref">mooncake_hybrid_connector.py:1530-1566</code>）
+            置 RECEIVING 并预校验覆盖（<code>imported_end ≥ expected</code> 且
+            <code>imported_start ≤ expected-W+1</code>，否则 fail-fast）；
+            <code>update_connector_output</code>（:1583-1612）置 READY / FAILED</td>
+        <td>状态与 imported 窗口记录完整 ✓</td>
+      </tr>
+      <tr>
+        <td>调度侧消费逻辑</td>
+        <td><code class="file-ref">patch_async_swa_kv_lifetime.py:192-216</code>：
+            RECEIVING/FAILED 跳过兜底命中检测；READY 经
+            <code>_private_swa_import_covers</code>（:119-133）覆盖复检后<b>清空 provisional
+            rollback</b>（"consume P-generated SWA directly"）→ swa_compute_start = confirmed</td>
+        <td>覆盖判据 [confirmed-W+1, confirmed) 与 P 侧窗口 [P-W, P) 恰有 1 token 富余 ✓</td>
+      </tr>
+      <tr>
+        <td>触发源去重</td>
+        <td>recompute_scheduler 的 else 分支整体删除——grep 确认
+            <code>private_swa_*</code> 在该文件零匹配</td>
+        <td>无条件回退触发源消失，触发逻辑 100% 集中在通用补丁 ✓</td>
+      </tr>
+      <tr>
+        <td>执行端消费</td>
+        <td>READY 无 rollback → 非 rollback 行 → restore 从环读——环里是刚传输的精确 KV</td>
+        <td>传输不再被重算覆盖；带宽浪费消除；P/D 数值回到精确 KV 同级 ✓</td>
+      </tr>
+      <tr>
+        <td>降级路径</td>
+        <td>FAILED 保留等待期 provisional rollback → 零历史 warm-up 重算
+            （rollback 行 history_len=0 不读部分传输的垃圾环）</td>
+        <td>降级语义安全 ✓</td>
+      </tr>
+    </tbody>
+  </table>
+  <p><b>遗留观察（3 点，非阻塞）</b>：</p>
+  <ul>
+    <li><b>FAILED 检测盲区（第六轮复核部分缓解）</b>：<code>private_swa_transfer_shared_block_ids</code>（:1558-1565）只收集
+        非私有组块，私有环页失效不会触发 READY→FAILED；且覆盖复检是范围型而非完整性校验——
+        私有页部分失败但范围对得上时会被当有效数据消费。<b>复核新发现第二层防线</b>
+        <code>_patched_handle_invalid_blocks</code>（<code class="file-ref">patch_async_swa_kv_lifetime.py:315-354</code>）：
+        worker 上报失效块时，交集匹配到 RECEIVING 请求 → FAILED；<b>匹配不到但存在接收中请求 → 全部 FAIL</b>
+        （"宁可错杀不可错放"），范围型校验对不上页级失效的问题被兜住。盲区残余：mooncake p2p 路径
+        <code>invalid_block_ids</code> 恒空时该防线不触发；</li>
+    <li><b>覆盖复检失败是硬崩</b>（:204-209 RuntimeError）：confirmed 与 imported 范围失配直接 crash
+        引擎，更稳妥是降级为 FAILED + rollback warm-up（数据缺失但可重算）；</li>
+    <li><b>小泄漏</b>：<code>_private_swa_receiving_requests</code> 条目在请求中途 abort 且
+        <code>finished_recving</code> 永不到达时不清理。</li>
+  </ul>
+</div>
+
+<div class="issue ok">
+  <h4><span class="tag ok">已修复 · 本会话实施并验证</span>A4. <code>dataclasses.replace</code> 丢私有元数据</h4>
+  <p><b>原问题</b>：<code>private_swa_metadata</code> 由调度侧补丁用 <code>setattr</code> 挂载，而
+     <code>dataclasses.replace()</code> 只复制<b>声明的 dataclass 字段</b>（遍历
+     <code>__dataclass_fields__</code>，不看 <code>__dict__</code>）。ngram_gpu 路径的
+     <code>replace(scheduler_output, ...)</code>（model_runner_v1.py）静默丢掉该属性 → 消费端
+     <code>getattr(..., None)</code> 返回 None 整块跳过 →
+     <code>set_private_swa_allocations</code> 不执行 → <code>private_swa_allocation_ids</code>
+     保持陈旧值/-1 → <code>compute_private_swa_slot_mapping</code> 对 allocation=-1 无校验，
+     代入 slot 公式 <code>(1 + (-1)*P + ring_block)*bs + offset</code> 静默算出错误槽位：
+     P=1 时 KV 写进块 0 哨兵（本步数据丢失 + 哨兵污染）；P=2 时混入负值（vLLM 约定 -1 才是跳过
+     哨兵，其他负值对 kernel 未定义）；陈旧 handle 时写进<b>别人的环</b>（跨请求串扰）。
+     finished 清理同被跳过，叠加 A5 同款泄漏。三层防线（getattr 默认值 / slot 校验缺失 /
+     kernel 不校验）全静默。</p>
+  <p><b>修复（最小修复方案，model_runner_v1.py:2147-2162）</b>：</p>
+  <pre><code># 捕获在 replace 之前（原对象上），重挂在 replace 之后（新对象上）
+private_swa_metadata_copy = getattr(
+    scheduler_output, "private_swa_metadata", None
+)
+scheduler_output = replace(
+    scheduler_output,
+    num_scheduled_tokens=num_scheduled_tokens_copy,
+    scheduled_spec_decode_tokens=spec_decode_tokens_copy,
+)
+if private_swa_metadata_copy is not None:
+    scheduler_output.private_swa_metadata = private_swa_metadata_copy</code></pre>
+  <p><b>验证</b>：</p>
+  <ul>
+    <li>Python 模拟复现：旧代码 replace 后 <code>hasattr = False</code>（bug 确认）；新代码属性保留、
+        引用共享（与 replace 对其他字段的浅拷贝语义一致）、无属性部署零开销 ✓</li>
+    <li>语法检查通过；grep 确认这是唯一丢属性的拷贝点（另两处 PCP/MM 与 async spec 路径用
+        <code>deepcopy</code>，天然复制 <code>__dict__</code>）✓</li>
+    <li>引用共享安全性：<code>private_swa_metadata</code> 是调度侧每步新建的 dict，runner 只读
+        （update 进自己的累积字典）；ngram 机制原地改的是另外两个 dict（已 .copy()）✓</li>
+  </ul>
+  <p><b>遗留加固项（未包含在最小修复内）</b>：<code>compute_private_swa_slot_mapping</code> 对
+     <code>alloc &lt; 0</code> 抛异常；<code>_update_states</code> 对"私有池开启但 metadata 缺失"
+     fail-fast 而非静默跳过——二者可防护未来同类 bug，建议后续补充。</p>
+</div>
+
+<div class="issue ok">
+  <h4><span class="tag ok">已修复 · 复核确认（遗留死代码清理建议）</span>A5. <code>private_swa_encoded_block_tables</code> 只 append 不清</h4>
+  <ul>
+    <li><b>原问题</b>：<code class="file-ref">block_table.py</code> 中每个调度步都向
+        <code>private_swa_encoded_block_tables</code> append，仅在 <code>__init__</code> 初始化一次，
+        跨步无界增长（内存泄漏）。</li>
+    <li><b>修复</b>：<code>set_private_swa_allocations</code> 每次调用开头重置为空列表
+        （<code class="file-ref">block_table.py:482</code>）。核实：列表上界收敛为
+        <code>私有组数 × num_reqs</code>（单步量）✓；重置位于参数校验之后、循环之前，
+        中途 raise 不残留跨步数据 ✓。</li>
+    <li><b>遗留死代码</b>：全仓 grep（vllm_ascend/ + tests/）确认该属性<b>没有任何读取方</b>——
+        只有 :445 初始化、:482 重置、:511 append 三处写入；编码 ID 的实际消费在局部变量
+        <code>encoded_ids</code>（:507-513，decode 后传给 <code>table.add_row</code>）。
+        建议删除三处写入，少一份无意义的每步构建开销（局部变量即被 GC，无行为差异）。</li>
+  </ul>
+</div>
+
+<div class="issue decision">
+  <h4><span class="tag decision">待确认</span>A6. MTP / eagle fork 子请求</h4>
+  <ul>
+    <li>fork 出的子请求经 <code>_patched_allocate_slots</code> reserve 全新 allocation，draft 无法复用父请求 SWA 环。</li>
+    <li>若 DSV4 MTP 子请求复用同一私有组，draft prefill 会走 A1 同款"从空环恢复历史"路径。</li>
+  </ul>
+</div>
+
+<div class="issue ok">
+  <h4><span class="tag ok">已核对无问题</span>数学与生命周期核对结果（供参考）</h4>
+  <ul>
+    <li>环容量数学：<code>capacity = W-1+in_flight</code>，bs=W=128 时 1-2 块恰覆盖窗口+draft；</li>
+    <li><code>compute_private_swa_slot_mapping</code> 的 <code>(pos//bs)%P</code> 环映射；</li>
+    <li><code>set_private_swa_allocations</code> 行构造（块 0 哨兵 + ring 页别名）；</li>
+    <li>commit 只写尾窗 <code>[P-W, P)</code>；restore / commit 索引算术；</li>
+    <li>decode 路径（环直写直读 + 绝对位置窗口掩码）；</li>
+    <li>分块 prefill 第二块不再回退（one-shot 清空）；</li>
+    <li>pool 的 retain / refcount 生命周期。</li>
+  </ul>
+</div>
+
+<h2>B. Rollback-128 链路</h2>
+
+<div class="issue ok">
+  <h4><span class="tag ok">已修复 · 复核确认</span>B1. compressor / indexer 的压缩槽位系统性错位</h4>
+  <p><b>原问题</b>：批次扩成 [R,P) 后仅覆写 <code>start_pos=H</code>，compressor kernel 按
+     <code>floor((H+j)/ratio)-floor(H/ratio)</code> 分组，token 实际绝对位置 R+j 被当作 H+j 压缩，
+     所有压缩组分配右移 H-R（c128 恰好 1 组、c4 移 32 组），叠加 RoPE 相位错位、state_cache 连续性破坏、
+     越界槽写入、topk 索引与存储错配。</p>
+  <p><b>修复方案</b>：新增 <code>_build_private_swa_persistent_prefill_view</code>
+     (<code class="file-ref">dsa_v1.py:2107-2193</code>)，为 compressor/indexer 构造 [H,P) 持久化子批，
+     接入全部 3 个调用点：主 compressor 路径
+     (<code class="file-ref">dsa_v1.py:2392-2421</code>)、indexer 普通路径
+     (<code class="file-ref">dsa_v1.py:2907-2917</code>)、indexer 多流路径
+     (<code class="file-ref">dsa_v1.py:3141-3151</code>)。</p>
+  <p><b>kernel 级逐项核实</b>：</p>
+  <table>
+    <thead><tr><th style="width:38%">修复点</th><th>核实结果</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>hidden_states 裁成 [H,P) 子批 + <code>cu_seqlens</code> 重建 + <code>start_pos=H</code>
+            (<code class="file-ref">dsa_v1.py:2160-2192</code>)</td>
+        <td>kernel 分组公式 <code>floor((H+j)/ratio)-floor(H/ratio)</code> 与绝对位置一致 ✓</td>
+      </tr>
+      <tr>
+        <td>RoPE 行索引</td>
+        <td>kernel <code>CopyRopeTile</code> 按 <code>compressedPos*ratio</code> 绝对位置索引，
+            从全量 cos/sin 表取 [H,P) 行 ✓</td>
+      </tr>
+      <tr>
+        <td>槽位计算 (<code class="file-ref">compressor_metadata.h:212-215</code>)</td>
+        <td><code>compressedPos = H/ratio + localIdx</code>，按请求行查 block table，
+            [H,P) 落槽正确 ✓</td>
+      </tr>
+      <tr>
+        <td><code>num_compressed_tokens</code> 按子批重算
+            (<code class="file-ref">dsa_v1.py:2179-2181</code>)</td>
+        <td>与 kernel 行数公式 <code>floor((H+q)/ratio)-floor(H/ratio)</code> 一致 ✓</td>
+      </tr>
+      <tr>
+        <td>IndexCache 写回按真实 token 位置散射
+            (<code class="file-ref">dsa_v1.py:2473-2483, 1507-1536</code>)</td>
+        <td><code>token_indices+offset</code> + <code>index_copy_</code>，只缓存 [H,P) 行 ✓</td>
+      </tr>
+      <tr>
+        <td>越界防护 + 回退逻辑</td>
+        <td>skip 范围校验 (<code class="file-ref">dsa_v1.py:2150-2155</code>)；
+            非 rollback 行 skip=0、无 rollback 批次走原逻辑 (<code class="file-ref">dsa_v1.py:2120-2126</code>) ✓</td>
+      </tr>
+    </tbody>
+  </table>
+  <p><b>附带效果</b>：B3（compressor 写槽绕过 slot mask）被结构性解决——compressor 写路径不再触碰
+     [R,H) 槽位。但同区域发现新的 B1b（见下）。</p>
+</div>
+
+<div class="issue critical">
+  <h4><span class="tag critical">严重 · 数值必错 · 新增发现</span>B1b. FA 压缩注意力范围被 workspace seq_lens 截断</h4>
+  <ul>
+    <li>FA 调用传 <code>seqused_kv=swa_exec_seq_lens</code>（workspace 局部长度）+
+        <code>metadata=swa_exec_sas_metadata</code>
+        (<code class="file-ref">dsa_v1.py:2499/2501、2523/2525</code>，后者由
+        <code>_private_swa_prefill_sas_metadata</code> 以 <code>seqused_kv=workspace_seq_lens</code> 构建)。</li>
+    <li>kernel 侧压缩注意力上界：<code>cmpS2IdLimit = (actOriS2Size - actS1Size + s1EndIdx + 1) / cmpRatio</code>
+        (<code class="file-ref">sparse_attn_sharedkv_swa_kernel.h:380、590</code>)，其中
+        <code>actOriS2Size</code> 即 seqused_kv：
+      <ul>
+        <li>原路径（全量 <code>seq_lens</code>）：<code>(compute_start + j + 1)/ratio</code> —— 完整因果范围 ✓</li>
+        <li>workspace 路径：<code>(history_len + j + 1)/ratio ≈ (128+j)/ratio</code> —— 仅约 1-2 个压缩组 ✗</li>
+      </ul>
+    </li>
+    <li>后果：<b>任何 confirmed &gt; W-1 的请求</b>（长 prompt 的第 2 块起、所有 rollback 请求），
+        压缩注意力被截断到约最后一个窗口；topk（由 lightning_indexer 以全量 seq_lens 计算）选中的更早压缩位置
+        被 <code>cmpS2IdLimit</code> 过滤丢弃，输出错误。</li>
+    <li>非本次 B1 修复引入的回归——首轮检视时已存在（当时聚焦写路径漏掉）；影响范围大于 rollback 场景，
+        覆盖<b>所有</b>私有池开启后的多块 prefill。</li>
+    <li><b>修复方向</b>（第七轮复核确认仍未修复：:2077/:2338/:2503/:2527 仍传 workspace 口径）：
+        workspace 的 sas metadata 单独传全量 seq_lens 口径的 cmp 范围
+        （ori/SWA 部分仍用 workspace 口径），或 kernel 侧改用绝对位置计算 limit。</li>
+    <li><b>风险定性（第七轮复核确认）：纯精度损失，无任何功能报错</b>：
+      <ul>
+        <li><b>不会崩溃/NaN</b>：kernel 侧 <code>actCmpS2Size</code> 只是<b>更小的循环上界</b>——
+            少算若干压缩组是合法子集计算，不越界、不触发 assert；即使回退行 j=0、history_len=0 时
+            limit=0，kernel 的零长检查（仅当 ori 和 cmp <b>同时</b>为零才跳过）也能安全处理——
+            ori 部分仍有 [0,j] 窗口，输出 shape 正常；</li>
+        <li><b>静默且确定性</b>：被丢弃的 topk 位置（kernel 内被 limit 过滤）不产生错误码或日志，
+            数值错误但每次相同——回归测试若不比对 logits/ppl 与基线的偏差<b>无法暴露</b>，
+            必须用长上下文（confirmed &gt; W-1 的多块 prefill）输出对比或 ppl 测试驱动；</li>
+        <li><b>影响面</b>：SWA 层的稀疏分支（compress_ratio &gt; 1 的层）对超出
+            [P-W, P) 之外的历史上下文"失忆"——长上下文场景下表现为召回类质量退化，
+            而非显式故障。这也是它比 A1-A4 更危险的地方：<b>所有自愈型/报错型防线都探测不到</b>。</li>
+      </ul>
+    </li>
+  </ul>
+</div>
+
+<div class="issue ok">
+  <h4><span class="tag ok">已随 A1 修复解决</span>B2. 零历史被计入 softmax</h4>
+  <ul>
+    <li><b>原问题</b>：kernel 侧 <code>oriMaskLeft = max(actS2Size - actS1Size + s1EndIdx - oriWinLeft, 0)</code>
+        (<code class="file-ref">sparse_attn_sharedkv_swa_kernel.h:692-697</code>) 只按窗口宽度截断，
+        旧实现对回退行 zero-fill 的 workspace 历史槽在 <code>[j-127, j]</code> 窗口内被真实读入并参与
+        softmax（exp(0)=1 权重），偏差经 KV 传播影响 [H, H+128) 的新 token。</li>
+    <li><b>现状</b>：A1 修复中回退行改为 <code>history_len=0</code>
+        (<code class="file-ref">dsa_v1.py:1953-1956</code>)，零填充方案连同
+        <code>workspace_flat.zero_()</code> 整体移除——回退行没有历史区域，
+        窗口掩码只覆盖实际存在的 token（窗口左界被 <code>max(...,0)</code> 截断到 [R, q]），
+        即"只 attend 存在的"，与设计文档的 position-based mask 要求一致。</li>
+    <li><b>剩余近似语义</b>（设计已知接受）：前 127 个回退 query 的窗口被截断为 [R, q] 而非
+        [q-127, q]——缺失历史本来就不存在，属确定性近似而非读垃圾。</li>
+  </ul>
+</div>
+
+<div class="issue ok">
+  <h4><span class="tag ok">已随 B1 修复解决</span>B3. <code>mask_shared_slots_for_private_swa_rollback</code> 对最需要保护的组无效</h4>
+  <ul>
+    <li><b>原问题</b>：-1 掩码只作用于各组 slot_mapping
+        (<code class="file-ref">block_table.py:532-556</code>)，而 compressor KV / state_cache /
+        indexer k_cache 的写入槽由 <code>compressor_metadata</code> op 现算，不经过 group
+        slot_mapping——掩码管不到 B1 错位写入的地方。</li>
+    <li><b>现状</b>：B1 修复后，compressor/indexer 写路径经由 persistent [H,P) 子批
+        (<code class="file-ref">dsa_v1.py:2107-2193</code>)，从源头不再触碰 [R,H) 槽位，
+        本问题被结构性解决。</li>
+    <li>掩码本身仍保留且仍然必要：full-attention 组的 [R,H) 槽位由它正确置 -1。</li>
+  </ul>
+</div>
+
+<div class="issue minor">
+  <h4><span class="tag minor">误报风险</span>B4. 陈旧元数据一致性检查可能误报</h4>
+  <ul>
+    <li><code>_prepare_inputs</code> 的 <code>shared_cache_length != compute_starts[row]</code> 检查遍历批内
+        <b>所有</b>行（含本步未调度的请求，<code class="file-ref">model_runner_v1.py:969</code>）。</li>
+    <li>async spec decode 拒绝修正会回退 <code>num_computed_tokens</code>
+        (<code class="file-ref">gpu_model_runner:1482-1486</code>)；若该请求下一步未被调度
+        (chunked prefill 让路)，旧 metadata 与修正后的值不相等 → RuntimeError 误报崩溃。</li>
+  </ul>
+</div>
+
+<div class="issue minor">
+  <h4><span class="tag minor">行为外溢 · 已给出修复方案</span>B5. <code>notify_kv_cache_written</code> 对所有用户延后</h4>
+  <ul>
+    <li><code class="file-ref">dsa_v1.py:2349/2540</code> 把 notify 移到 FA 之后且未按
+        <code>VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL</code> 门控——私有池关闭的 DSV4 用户也会丢失
+        P/D connector 同步事件重叠。</li>
+    <li><b>契约</b>：<code>maybe_save_kv_layer_to_connector</code>（<code class="file-ref">dsa_v1.py:1774</code>）
+        交给 connector 的是注册张量本身。私有池开启时 SWA 注册张量是<b>环</b>，而 prefill 的 scatter 写的是
+        workspace，环要等 <code>_commit_private_swa_prefill</code> 才有数据——所以事件必须记录在
+        "最后写环"之后，且越早越好（拷贝流才能与后续计算重叠）。</li>
+  </ul>
+  <p><b>推荐修复：commit 提前到 FA 之前 + notify 单点放在 FA 之前</b>。
+     原注释 "Publish the new tail only after FA has consumed the workspace" 过度保守，
+     commit-before-FA 的安全性核查：</p>
+  <table>
+    <thead><tr><th style="width:38%">检查项</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td>commit 读 workspace 尾窗行，FA 也读同一区域</td><td>read-read，无冲突 ✓</td></tr>
+      <tr><td>commit 写环，本次 FA 读的是 workspace + compressor cache</td><td>环对本次 FA 不可见，无冲突 ✓</td></tr>
+      <tr><td>跨层</td><td>层间串行，workspace 逐层重建，每层 prepare→scatter→commit→FA 自洽 ✓</td></tr>
+      <tr><td>多流路径</td><td><code>_mla_prolog_multistream</code> 尾部已有
+          <code>main_stream.wait_stream(aux_stream)</code>，scatter 在 commit 之前有序 ✓</td></tr>
+      <tr><td>CP 交互</td><td>私有池 prefill 本就拒绝 PCP/DCP，无交互 ✓</td></tr>
+    </tbody>
+  </table>
+  <p>compress_ratio ≤ 1 路径（<code class="file-ref">dsa_v1.py:2320-2350</code>）：</p>
+  <pre><code>DeviceOperator.dsa_kv_compress_scatter(swa_exec_kv_cache, kv, swa_exec_slot_mapping)
+if envs.VLLM_ASCEND_ENABLE_PRIVATE_SWA_POOL:
+    self._commit_private_swa_prefill(swa_exec_kv_cache, private_swa_kv_cache, swa_commit_state)
+notify_kv_cache_written(layer_name)      # 唯一调用点：环已定稿，FA 之前
+
+attn_output = attn_op(...)               # connector 拷贝流与 FA 重叠
+return attn_output</code></pre>
+  <ul>
+    <li>compress_ratio &gt; 1 路径同理：SWA scatter（:2320）→ SWA commit → compressor/indexer 计算与
+        scatter（:2438）→ <b>notify</b> → 两个 FA 调用（:2491/:2516）——注册张量含 compressor cache，
+        notify 放在 compressor scatter 之后、FA 之前。</li>
+    <li>两种模式<b>都</b>拿回重叠收益（私有池开启时比现状更好——现状拷贝完全串行在 FA 之后），
+        且只有一处调用点。</li>
+    <li><b>保守备选</b>（不动 commit 位置）：按开关分流——OFF 时 notify 放回原位置
+        （scatter 后、FA 前），ON 时保持 commit 后。零风险，但两个调用点，私有池用户继续承受串行化。</li>
+    <li>建议把"定稿 + 通知"封成一个 helper（如 <code>_finalize_swa_prefill_and_notify</code>），
+        commit 与 notify 永远绑定出现，防止后续改动再次拆开导致错序。</li>
+    <li>decode 路径（<code class="file-ref">dsa_v1.py:2783</code>）<b>不用动</b>：decode 直接 scatter
+        进环（无 workspace/commit），notify 已在 scatter 后、FA 前，两种模式本来就正确。</li>
+  </ul>
+</div>
+
+<h2>C. 社区版本兼容性检查（第八轮 · 对照 v0.23.0）</h2>
+
+<div class="card">
+  <p><b>检查对象</b>：最新提交 <code>b1ccb9638</code>（"add private pool and roll back"，旧 hash
+     <code>6852bed26</code> 已被 amend）+ 未提交工作区修改。<br>
+     <b>社区参照</b>：/home/xujiuxu/code/PD_project/vllm（tag <code>v0.23.0</code>，2026-06-14）。<br>
+     <b>辅助参照</b>：/home/xujiuxu/code/gitee-vllm（v0.23.1rc0-550，晚 2 周）——排查 API 形状来源时使用。<br>
+     <b>根因</b>：coordinator 覆写块的 API 形状部分抄自 gitee 参照，而 v0.23.0 之后 vllm 改了
+     4 处 KV cache 管理 API。已核实兼容的上游接口（关键项）：
+     Scheduler 五个被 patch 方法、KVCacheManager.get_computed_blocks/allocate_slots/free、
+     cache_blocks+retention_interval、allocate_new_blocks/free/get_num_common_prefix_blocks、
+     kv_cache_utils 五个符号（_get_kv_cache_config_packed 缺失已被 getattr 回退正确处理）、
+     SlidingWindowMLASpec.model_version、RequestStatus.WAITING_FOR_REMOTE_KVS、
+     SchedulerOutput setattr 模式、KVConnectorOutput.finished_recving/invalid_block_ids、
+     update_connector_output 钩子链、mooncake 全部调度侧 API、max_concurrent_batches 等。</p>
+</div>
+
+<div class="issue ok">
+  <h4><span class="tag ok">已修复 · 复核确认</span>C1. allocate_new_computed_blocks 调用两个 gitee-only 方法</h4>
+  <ul>
+    <li><b>原问题</b>：覆写体无条件调用 <code>add_local_computed_blocks</code>（每次前缀命中）+
+        <code>allocate_external_computed_blocks</code>（external&gt;0 时）——社区 v0.23.0 两个方法都不存在，
+        <b>首次前缀命中即 AttributeError</b>，影响所有 hybrid 模型、与私有池开关无关。</li>
+    <li><b>修复（已提交，a4646ab3e）</b>：覆写体改回 v0.23.0 的<b>单一 4 参上游调用</b>
+        <code>manager.allocate_new_computed_blocks(request_id, blocks, num_local, num_external)</code>
+        （外部 token 由上游方法内部处理），仅保留私有组跳过；gitee-only 方法 grep 清零 ✓；
+        docstring 明确"SingleTypeKVCacheManager owns the complete local-hit/external-KV allocation protocol"。</li>
+    <li><b>接口一致性测试已补</b>（<code class="file-ref">test_prefix_cache_cp_patches.py:494</code>
+        test_allocate_new_computed_blocks_uses_upstream_manager_interface）：断言 shared manager 收到
+        单一 4 参调用、private manager 不被调用 ✓——正是第八轮建议的用例，可直接抓住本类问题。</li>
+  </ul>
+</div>
+
+<div class="issue ok">
+  <h4><span class="tag ok">已修复 · 已提交</span>C2. remove_skipped_blocks 3 参签名在 v0.23.0 上 TypeError</h4>
+  <ul>
+    <li><b>原问题</b>：覆写为 3 参（多出 v0.23.0 之后才加的 <code>num_prompt_tokens</code>），
+        每次 allocate_slots 必经 → TypeError。</li>
+    <li><b>修复（已提交，a4646ab3e）</b>：2 参签名 + 2 参 manager 调用，与社区逐字一致 ✓；
+        接口测试 test_remove_skipped_blocks_matches_upstream_interface 已入库 ✓。</li>
+    <li>同类问题 <code>get_num_blocks_to_allocate</code>（7 参签名 + 6 位置参数）已在此前提交修复
+        ——6 参 + 5 位置参数，与社区逐字一致（含 CrossAttention 分支）✓。</li>
+  </ul>
+</div>
+
+<div class="issue ok">
+  <h4><span class="tag ok">已确认 · 测试固化</span>C3. 版本绑定：修复后代码仅兼容 v0.23.0，与 gitee 参照不兼容</h4>
+  <ul>
+    <li>gitee 的 kv_cache_manager.py:400-404 调用 <code>coordinator.remove_skipped_blocks(...,
+        num_prompt_tokens=request.num_prompt_tokens)</code> → 修复后的 2 参覆写在 gitee 上 TypeError。</li>
+    <li>修复方向二选一：当前代码 = v0.23.0-correct / gitee-incompatible。分支已打 [v0.23.0] 标签
+        且社区参照为 v0.23.0，<b>方向正确</b>。</li>
+    <li><b>绑定已固化</b>：三份接口一致性测试（get_num_blocks_to_allocate / remove_skipped_blocks /
+        allocate_new_computed_blocks，<code class="file-ref">test_prefix_cache_cp_patches.py:450/481/494</code>）
+        以 v0.23.0 接口形状为断言基准——若误升 vllm 版本，测试立即失败 ✓。</li>
+    <li><b>风险控制</b>：确认运行环境/CI 安装 vllm==0.23.0（非 gitee 构建）；gitee 目录不再作为
+        该分支的调试 vllm；PR 描述中明确目标版本。</li>
+  </ul>
+</div>
+
+<div class="issue ok">
+  <h4><span class="tag ok">已删除 · 已提交</span>C4. pop_blocks_for_free 覆写引用 v0.23.0 不存在的 API</h4>
+  <ul>
+    <li><b>原问题</b>：覆写定义并调用 <code>manager.pop_blocks_for_free</code>（v0.23.0 无此 API，
+        gitee 新增）——死代码，API 来源混杂证据。</li>
+    <li><b>修复（已提交，a4646ab3e）</b>：覆写整体删除，grep 清零 ✓。</li>
+  </ul>
+</div>
+
+<div class="issue minor">
+  <h4><span class="tag minor">部分修复 · 缺口 A 已解决，缺口 B 残留</span>C5. _patched_handle_invalid_blocks 提前 return 跳过社区记账</h4>
+  <ul>
+    <li>签名/属性与 v0.23.0 完全兼容 ✓；默认策略（fail）下社区调用方将返回集
+        finish_requests(FINISHED_ERROR) ✓。</li>
+    <li><b>缺口 A（recompute 策略挂死）——已修复</b>：<code class="file-ref">patch_async_swa_kv_lifetime.py:554</code>
+        在私有池启用时<b>强制 <code>recompute_kv_load_failures = False</code></b>，注释明确设计意图
+        （"Any load failure is terminal because recomputing the prefix would recreate the A3
+        overwrite bug this protocol is designed to prevent"）——加载失败一律按 terminal 处理，
+        社区调用方走 finish_requests 路径，请求不会滞留 skipped_waiting ✓；
+        env 关闭时不触碰该标志（:554 位于 private_group_ids 块内）✓。</li>
+    <li><b>缺口 B（混合场景）——残留</b>：存在 receiving 请求但 invalid 块属于其他非 receiving 请求时，
+        交集未命中即"全 fail"所有 receiving（误伤），且真正受影响的请求无 num_computed 调整、
+        不在返回集也不被 finish → 带着失效 KV 继续跑。触发条件窄：mooncake p2p 不产生
+        invalid_block_ids（恒空），设计上失效 ID 来自 receiving 请求自身共享组
+        （docstring 声明）；残余风险主要在 ascend_store 类来源与其他失败并发时。</li>
+    <li><b>修复方向</b>（未实施）：仅当 invalid_block_ids 与 receiving 请求共享块<b>全量匹配</b>时走私有短路，
+        否则透传社区原方法合并处理。</li>
+  </ul>
+</div>
+
+<h2>附：问题一览表</h2>
+<table>
+  <thead>
+    <tr>
+      <th style="width:6%">编号</th>
+      <th style="width:12%">级别</th>
+      <th style="width:38%">问题</th>
+      <th style="width:44%">位置 / 关键点</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>A1</td><td>已修复 ✓</td><td>非 D 节点前缀命中读未初始化显存 —— get_computed_blocks 通用补丁 + 调度差值兜底 + history_len=0 三层修复</td><td>修复：patch_async_swa_kv_lifetime.py:111-127（新增）；private_swa_pool.py:88-109（新增）；dsa_v1.py:1953-1956；核实：vLLM request.py:328（WAITING_FOR_REMOTE_KVS）</td></tr>
+    <tr><td>A2</td><td>已修复 ✓</td><td>workspace 容量公式漏算回退 token —— 公式集中为 compute_private_swa_prefill_workspace_blocks（两调用点共用），每请求项 W+bs-1</td><td>修复：private_swa_pool.py:112-135（新增）；dsa_v1.py:1896、1963；patch_kv_cache_utils.py:355、365；测试：tests/ut/core/test_private_swa_pool.py:55-84</td></tr>
+    <tr><td>A3</td><td>需决策</td><td>D 节点传输的精确 KV 被回退重算覆盖</td><td>recompute_scheduler.py:575-593；mooncake_hybrid_connector.py:1567-1600</td></tr>
+    <tr><td>A4</td><td>已修复 ✓（本会话实施）</td><td><code>replace()</code> 丢 <code>private_swa_metadata</code> —— replace 前捕获、replace 后重挂载（最小修复），模拟验证通过</td><td>修复：model_runner_v1.py:2147-2162；验证：Python 模拟（旧行为 hasattr=False 复现 bug，新行为属性保留）；遗留加固：alloc&lt;0 校验、metadata 缺失 fail-fast</td></tr>
+    <tr><td>A5</td><td>已修复 ✓</td><td><code>private_swa_encoded_block_tables</code> 无界增长 —— set_private_swa_allocations 每次调用重置（:482）；遗留死代码：该属性无读取方，建议删除三处写入</td><td>block_table.py:445/482/511</td></tr>
+    <tr><td>A6</td><td>待确认</td><td>MTP / eagle fork 子请求无法复用父 SWA 环</td><td>patch_async_swa_kv_lifetime.py（_patched_allocate_slots）</td></tr>
+    <tr><td>B1</td><td>已修复 ✓</td><td>compressor / indexer 压缩槽位系统性错位 (H-R) —— persistent [H,P) 子批方案修复</td><td>修复：dsa_v1.py:2107-2193（新增）、2392-2421、2907-2917、3141-3151；核实：compressor_kernel_perf.h:637-645、compressor_metadata.h:160-215</td></tr>
+    <tr><td>B1b</td><td>严重 · 数值必错（新增）</td><td>FA 压缩注意力范围被 workspace seq_lens 截断（cmpS2IdLimit ≈ 1-2 组）</td><td>dsa_v1.py:2499/2501、2523/2525；sparse_attn_sharedkv_swa_kernel.h:380、590</td></tr>
+    <tr><td>B2</td><td>已随 A1 解决 ✓</td><td>零历史槽计入 softmax —— 回退行 history_len=0，零填充方案移除，仅剩设计已知的窗口截断近似</td><td>dsa_v1.py:1953-1956；sparse_attn_sharedkv_swa_kernel.h:692-697（窗口掩码依据）</td></tr>
+    <tr><td>B3</td><td>已随 B1 解决 ✓</td><td>slot_mapping 掩码管不到 compressor/state/indexer 写槽 —— persistent 子批从源头避开 [R,H) 槽位</td><td>block_table.py:532-556（掩码保留，仍保护 full-attention 组）；dsa_v1.py:2107-2193</td></tr>
+    <tr><td>B4</td><td>工程项</td><td>陈旧元数据一致性检查对未调度请求误报</td><td>model_runner_v1.py:969；gpu_model_runner:1482-1486</td></tr>
+    <tr><td>B5</td><td>工程项 · 已给出方案</td><td>notify 延后未按开关门控 —— 建议 commit 提前至 FA 前 + notify 单点（两模式均恢复重叠）</td><td>dsa_v1.py:2349/2540（notify）；2320-2350（改法）；1774（契约来源）</td></tr>
+    <tr><td>C1</td><td>已修复 ✓（a4646ab3e）</td><td>allocate_new_computed_blocks 改回单一 4 参上游调用，gitee-only 方法清零，接口一致性测试入库（test_allocate_new_computed_blocks_uses_upstream_manager_interface）</td><td>patch_kv_cache_coordinator.py；tests/ut/patch/platform/test_prefix_cache_cp_patches.py:494</td></tr>
+    <tr><td>C2</td><td>已修复 ✓（已提交）</td><td>remove_skipped_blocks 2 参签名 + 测试；get_num_blocks_to_allocate 同类问题此前已修</td><td>patch_kv_cache_coordinator.py:343；test_prefix_cache_cp_patches.py:450/481</td></tr>
+    <tr><td>C3</td><td>已确认 · 测试固化</td><td>版本绑定 v0.23.0（方向正确）；三份接口测试以 v0.23.0 形状为断言基准，误升版本即测试失败</td><td>test_prefix_cache_cp_patches.py:450/481/494；gitee kv_cache_manager.py:400-404 为反证</td></tr>
+    <tr><td>C4</td><td>已删除 ✓（已提交）</td><td>pop_blocks_for_free 覆写整体删除，grep 清零</td><td>patch_kv_cache_coordinator.py</td></tr>
+    <tr><td>C5</td><td>部分修复（A ✓ / B 残留）</td><td>缺口 A：私有池启用时强制 recompute_kv_load_failures=False，加载失败按 terminal 处理，杜绝挂死；缺口 B 残留：混合失效场景误伤 receiving + 真实受影响请求无调整（仅 ascend_store 类来源可触发）</td><td>patch_async_swa_kv_lifetime.py:554（缺口 A 修复）；社区 scheduler.py:1581-1583</td></tr>
+  </tbody>
+</table>
+
+<footer class="muted" style="margin-top:2.5rem; font-size:0.85rem; text-align:center;">
+  本报告由代码检视生成 · 仅列出问题未做修改 · vllm-ascend / swa_private_pool
+</footer>
+
+</div>
+</body>
+</html>
